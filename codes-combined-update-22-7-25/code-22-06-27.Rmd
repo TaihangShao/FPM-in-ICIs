@@ -1,0 +1,1289 @@
+---
+title: "Survival-Model"
+author: "Taihang Shao"
+date: '2022-06-27'
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE) # set R Markdown options
+rm(list = ls()) # clear memory (removes all the variables from the workspace)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax
+for authoring HTML, PDF, and MS Word documents. For more details on
+using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that
+includes both content as well as the output of any embedded R code
+chunks within the document. You can embed an R code chunk like this:
+
+```{r Library packages, include=FALSE}
+library("ggplot2")     # Mainly for plotting
+library("tidyverse")   # Mainly for plotting
+library("flexsurv")    # RPs (also loads survival) and BC case-study
+library("gridExtra")   # Plotting
+library("survHE")      # Plotting
+library("discSurv")    # Create life tables
+library("mgcv")        # GAM/RCS
+library("survminer")   #KM curve
+library("lme4")        # RE components
+library("KFAS")        # DSM
+library("zoo")         # Aid in time-series analyses
+library("cuRe")        # Cure model
+library("here")        # Here
+library("flexsurvcure")#mix/nmix-cure model
+
+```
+
+```{r Prepare data and learn about Gef, echo=TRUE}
+theme_set(theme_light())  # GGplot theme
+###  prepare data  ####
+gef<-read.csv("gef-90m.csv")
+gef<-data.frame(gef$event,gef$time)
+gef<-rename(gef,"censrec"="gef.event","recyrs"="gef.time")
+gef$recyrs<-gef$recyrs/12
+
+## Learn about gef
+table(gef$censrec)
+gef %>%
+  summarise(Min_surv = min(recyrs, na.rm = TRUE),
+            Max_surv = max(recyrs, na.rm = TRUE),
+            Mean_surv = mean(recyrs, na.rm = TRUE),
+            SD_surv = sd(recyrs, na.rm = TRUE))
+##process: devide gef into 2 part,1 is 48m, another is 90m
+gef_in = gef %>% mutate(censrec = case_when(gef$recyrs > 4 ~ integer(1), TRUE ~ gef$censrec),
+                      recyrs = case_when(gef$recyrs > 4 ~ 4, TRUE ~ gef$recyrs),
+                      rectime = recyrs * 365)
+gef_out = gef %>% filter(recyrs > 4)
+gef_out$rectime<-gef_out$recyrs*365
+
+##Monthly life table estimates of hazard
+gef_in$rectime2 <- as.integer(gef_in$rectime/(365.24/12)) + 1
+gef_out$rectime2 <- as.integer(gef_out$rectime/(365.24/12)) + 1
+
+ltgef <- lifeTable(gef_in, timeColumn = "rectime2", eventColumn = "censrec")
+ltHaz <- data.frame(hazKM = ltgef$Output$hazard, Time = (seq(1:length(ltgef$Output[,1]))-0.5)/12,
+                    AtRisk = ltgef$Output$atRisk, Events = ltgef$Output$events)
+# The above hazard is the product-limit (KM) estimate. Also calculate the life-table (acturial) estimate
+ltHaz$hazLT = ltHaz$Events / (ltHaz$AtRisk - ltHaz$Events/2)
+# Generate log-time
+ltHaz$lnTime <- log(ltHaz$Time)
+# For random effects add an ID for each time period
+ltHaz$MyId <- 1:dim(ltHaz)[1] # Generate id variable 
+# For AR(1) model get outcomes lagged by one.
+ltHaz$EventsL <- lag(ltHaz$Events)
+# Set first lagged value = 0 (usually would discard, but retain so IC are comparable. Can be justified as a prior value)
+ltHaz$EventsL[1] <- 0
+#Set surv data
+ltHaz$surv <- ltgef$Output$S
+
+```
+
+```{r Test of linearity, echo=TRUE}
+glmTemp <- flexsurvreg(Surv(recyrs, censrec) ~ 1, data = gef_in, dist = "weibull")
+tmp_hz <- summary(glmTemp, t=ltHaz$Time, type="hazard")[[1]]$est
+glmTemp <- flexsurvreg(Surv(recyrs, censrec) ~ 1, data = gef_in, dist = "gompertz")
+tmp_hz <- data.frame(Weibull=tmp_hz, Gompertz=summary(glmTemp, t=ltHaz$Time, type="hazard")[[1]]$est)
+tmp_hz <- log(tmp_hz/12)
+df_fig_hz <- data.frame(Time=ltHaz$Time, LogTime=log(ltHaz$Time), Loghazard=log(ltHaz$hazLT+0.001), Sample=ltHaz$AtRisk, tmp_hz)
+fig_a <- ggplot(data=df_fig_hz, aes(x=Time, y=Loghazard)) + geom_point(shape = 1, color="grey40") +
+  geom_line(aes(y=Gompertz), color="red") + guides(size="none") +
+  labs(y="Log(hazard)") + ggtitle("Gompertz") + coord_cartesian(ylim=c(-7,-2))
+fig_b <- ggplot(data=df_fig_hz, aes(x=LogTime, y=Loghazard)) + geom_point(shape = 1, color="grey40") +
+  geom_line(aes(y=Weibull), color="purple") + guides(size="none") +
+  labs(y="Log(hazard)", x="Log(time)") + ggtitle("Weibull") + coord_cartesian(ylim=c(-7,-2))
+# Part (c, d) - get survival estimates
+KM_sv <- survfit(formula = Surv(gef_in$recyrs, gef_in$censrec) ~ 1)
+KM_sv <- data.frame(Time=KM_sv$time, Survival=KM_sv$surv)
+KM_sv <- filter(KM_sv, Survival < 1)
+glmTemp <- flexsurvreg(Surv(recyrs, censrec) ~ 1, data = gef_in, dist = "lnorm")
+tmp_sv <- qnorm(1-summary(glmTemp, t=KM_sv$Time, type="survival")[[1]]$est)
+glmTemp <- flexsurvreg(Surv(recyrs, censrec) ~ 1, data = gef_in, dist = "llogis")
+tmp_sv <- data.frame(Lognormal=tmp_sv, Loglogistic=qlogis(1-summary(glmTemp, t=KM_sv$Time, type="survival")[[1]]$est))
+df_fig_sv <- data.frame(LogTime=log(KM_sv$Time), Inv_prob=qnorm(1-KM_sv$Survival),
+                        Logistic=qlogis(1-KM_sv$Survival), tmp_sv)
+fig_c <- ggplot(data=df_fig_sv, aes(x=LogTime, y=Logistic)) + geom_point(shape = 1, color="grey40") +
+  geom_line(aes(y=Loglogistic), color="seagreen") +
+  labs(y="Logit(cumulative failures)", x="Log(time)") + ggtitle("Log-logistic")
+fig_d <- ggplot(data=df_fig_sv, aes(x=LogTime, y=Inv_prob)) + geom_point(shape = 1, color="grey40") +
+  geom_line(aes(y=Lognormal), color="blue") +
+  labs(y="Probit(cumulative failures)", x="Log(time)") + ggtitle("Lognormal")
+
+grid.arrange(fig_a, fig_b, fig_c, fig_d, ncol=2, widths=c(1, 1))
+
+```
+
+```{r date put in the model, echo=TRUE}
+###  date put in the model####
+follow_up <- 48
+numMod <- 17 # Models considered
+MyTH <- 7.5 # Time Horizon (years)
+MyStep <- 12 # Number of obs. per year
+MyN <- MyTH*MyStep # Total time points (observed & extrapolated)
+dfHazEst <- array(dim=c(numMod, MyN))
+Newtime <- data.frame(lnTime = log(seq(from=1/MyStep, to=MyTH, by=1/MyStep)), AtRisk = 1)
+Newtime$MyId <- 1:dim(Newtime)[1]
+Newtime$MyId <- ifelse(Newtime$MyId > follow_up, follow_up, Newtime$MyId)  # Random effects: Using last observed ID for extrapolation
+Newtime$EventsL <- 0
+Newtime$EventsL[1:follow_up] <- lag(ltHaz$Events)
+Newtime$EventsL[1] <- 0
+Newtime$EventsL <- ifelse(Newtime$MyId > follow_up, 0, Newtime$EventsL) # AR: Using last observed event count for extrapolation
+# Also have 1x GOF matrix. Rows = Methods, Columns = Method, LL, AIC
+dfGOF <- data.frame(matrix(, nrow=17, ncol=4))
+colnames(dfGOF) <- c("Model","LnL","Params","AIC")
+# Below is constant for when have to derive log-likelihood
+llCons <- sum(ltHaz$Events*log(ltHaz$AtRisk) - log(factorial(ltHaz$Events)))
+# Names of models to consider
+modnames <- list("SD","FP","RCS","RP","GAM1","GAM2","PW","Mixture Model","cuRe_mixture","cuRe_nmixture","Flex_cure_mix","Flex_cure_nmix")
+
+##data for sd
+sd_gef<-data.frame("time"=gef_in$recyrs,"event"=gef_in$censrec)
+
+```
+
+```{r Standard Parametric Models, echo=TRUE}
+MODi <- 1 # Model index
+myLnL <- array(dim=8)
+myAIC <- array(dim=8)
+MyDists <- list("exp","weibull","gamma","lnorm","gompertz","llogis","gengamma","genf")
+for (i in 1:8){
+  glmTemp <- flexsurvreg(Surv(recyrs, censrec) ~ 1, data = gef_in, dist = MyDists[[i]])
+  myLnL[i] <- glmTemp$loglik
+  myAIC[i] <- glmTemp$AIC
+}
+SRVres <- data.frame(unlist(MyDists))
+SRVres <- cbind(SRVres,myLnL,myAIC)
+colnames(SRVres) <- c("Powers","LnL","AIC")
+SRVres <- arrange(SRVres, AIC)
+best_sd3<-c(SRVres$Powers[[1]],SRVres$Powers[[2]],SRVres$Powers[[3]])
+##rank1
+i<-which(MyDists==SRVres$Powers[[1]])
+glmTemp <- flexsurvreg(Surv(recyrs, censrec) ~ 1, data = gef_in, dist = MyDists[[i]])
+dfHazEst[MODi,] <- summary(glmTemp, t=exp(Newtime$lnTime), type="hazard")[[1]]$est/12
+ltHaz[[MyDists[[i]]]] <- summary(glmTemp, t=ltHaz$Time, type="hazard")[[1]]$est/12
+dfGOF[MODi,1] <- MyDists[[i]]
+dfGOF[MODi,2] <- sum(ltHaz$Events*log(ltHaz[[MyDists[[i]]]]) - ltHaz[[MyDists[[i]]]]*ltHaz$AtRisk) + llCons
+dfGOF[MODi,3] <- glmTemp$npars
+##rank2
+MODi <- 2
+i<-which(MyDists==SRVres$Powers[[2]])
+glmTemp <- flexsurvreg(Surv(recyrs, censrec) ~ 1, data = gef_in, dist = MyDists[[i]])
+dfHazEst[MODi,] <- summary(glmTemp, t=exp(Newtime$lnTime), type="hazard")[[1]]$est/12
+ltHaz[[MyDists[[i]]]] <- summary(glmTemp, t=ltHaz$Time, type="hazard")[[1]]$est/12
+dfGOF[MODi,1] <- MyDists[[i]]
+dfGOF[MODi,2] <- sum(ltHaz$Events*log(ltHaz[[MyDists[[i]]]]) - ltHaz[[MyDists[[i]]]]*ltHaz$AtRisk) + llCons
+dfGOF[MODi,3] <- glmTemp$npars
+##rank3
+MODi <- 3
+i<-which(MyDists==SRVres$Powers[[3]])
+glmTemp <- flexsurvreg(Surv(recyrs, censrec) ~ 1, data = gef_in, dist = MyDists[[i]])
+dfHazEst[MODi,] <- summary(glmTemp, t=exp(Newtime$lnTime), type="hazard")[[1]]$est/12
+ltHaz[[MyDists[[i]]]] <- summary(glmTemp, t=ltHaz$Time, type="hazard")[[1]]$est/12
+dfGOF[MODi,1] <- MyDists[[i]]
+dfGOF[MODi,2] <- sum(ltHaz$Events*log(ltHaz[[MyDists[[i]]]]) - ltHaz[[MyDists[[i]]]]*ltHaz$AtRisk) + llCons
+dfGOF[MODi,3] <- glmTemp$npars
+
+```
+
+```{r Fractional polynomials, echo=TRUE}
+MODi <- 4
+#-----FP1 ----#
+myLnL <- array(dim=5)
+myAIC <- array(dim=5)
+MyPowers <- list(c(-2,-1,1,2,3))
+for (i in 1:5){
+  glmTemp <- glm (Events ~ I(lnTime^MyPowers[[1]][i]) + offset(log(AtRisk)), family=poisson, data=ltHaz)
+  myLnL[i] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+  myAIC[i] <- extractAIC(glmTemp)[2]
+}
+FP1res <- data.frame(c("minusTwo","minusOne","One","Two","Three"))
+FP1res <- cbind(FP1res,myLnL,myAIC)
+colnames(FP1res) <- c("Powers","LnL","AIC")
+which.min(FP1res$AIC) # 341.5919, for time^2
+best_fp1<-FP1res$Powers[[which.min(FP1res$AIC) ]]
+
+#-----FP2 -----#
+myLnL <- array(dim=10)
+myAIC <- array(dim=10)
+MyPowers <- list(c(-2,-1,1,2,3))
+index <- 1
+for (i in 1:5){
+  for (j in 1:5){
+    if (j > i) {
+      glmTemp <- glm(Events ~ I(lnTime^MyPowers[[1]][i]) + I(lnTime^MyPowers[[1]][j])+ offset(log(AtRisk)), family=poisson, data=ltHaz)# 
+      myLnL[index] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+      myAIC[index] <- extractAIC(glmTemp)[2]
+      index <- index + 1
+    }
+  }
+}
+FP2res <- data.frame(c("minusTwo+minusOne","minusTwo+One","minusTwo+Two","minusTwo+Three","minusOne+One",
+                       "minusOne+Two","minusOne+Three","One+Two","One+Three","Two+Three"))
+FP2res <- cbind(FP2res,myLnL,myAIC)
+colnames(FP2res) <- c("Powers","LnL","AIC")
+which.min(FP2res$AIC) #312.843 for time^2 and time^3.
+best_fp2<-FP2res$Powers[[which.min(FP2res$AIC) ]]
+
+
+##FP  choose model###
+# Now for the closed-test procedure for function selection
+# Note currently identifying best models manually
+# modify power
+modFP2 <- glm(Events ~ I(lnTime^(1)) + I(lnTime^2) + offset(log(AtRisk)), family=poisson, data=ltHaz)#
+modFP1 <- glm(Events ~ I(lnTime^(1))+ offset(log(AtRisk)) , family=poisson, data=ltHaz)
+modLin <- glm(Events ~ lnTime + offset(log(AtRisk)), family=poisson, data=ltHaz)
+modNULL <- glm(Events ~ 1 + offset(log(AtRisk)), family=poisson, data=ltHaz)  
+# Overall association of the outcome with time (Sig result = include time)
+anova(modNULL, modFP2, test="LRT") # p-value 6.798e-15
+# Evidence for non-linearity (Sig result = non-linear model)
+anova(modLin, modFP2, test="LRT") # p-value 2.265e-11
+# Simpler or more complex non-linear model?  (Sig result = FP2, else FP1)
+anova(modFP1, modFP2, test="LRT") # p-value 2.937e-08  
+# Hence use FP2 model
+
+###combine FP results###
+#(FP2-best)
+dfGOF[MODi,1] <- modnames[[2]]
+dfGOF[MODi,2] <- (extractAIC(modFP2)[2] - 2*extractAIC(modFP2)[1])*(-0.5)
+dfGOF[MODi,3] <- extractAIC(modFP2)[1]
+# Hazard estimates
+dfHazEst[MODi,] <- predict(modFP2, newdata=Newtime, type="response") # Extrapolated
+ltHaz[modnames[[2]]] <- predict(modFP2, newdata=ltHaz, type="response")  # Within-sample
+
+```
+
+```{r Restricted cube spline, echo=TRUE}
+MODi <- 5
+# First need knot locations for up to 5 internal knots.
+# Basing these on equally-spaced percentiles of the observed (uncensored) death times.
+gef2 <- subset(gef_in, censrec==1)
+myLnL <- array(dim=5)
+myAIC <- array(dim=5)
+for (i in 1:5){
+  glmTemp <- gam(Events ~ s(lnTime, bs="cr", k=i+2, fx=TRUE) + offset(log(AtRisk)), knots=list(lnTime=quantile(log(gef2$recyrs), seq(from=0, to=1, by=1/(1+i))), length=i+2), family=poisson, data=ltHaz)
+  myLnL[i] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+  myAIC[i] <- extractAIC(glmTemp)[2]
+}
+RCSres <- data.frame(c("One","Two","Three","Four","Five"))
+RCSres <- cbind(RCSres,myLnL,myAIC)
+colnames(RCSres) <- c("Int.Knots","LnL","AIC")
+i <- which.min(RCSres$AIC)
+glmTemp <- gam(Events ~ s(lnTime, bs="cr", k=i+2, fx=TRUE) + offset(log(AtRisk)), knots=list(lnTime=quantile(log(gef2$recyrs), seq(from=0, to=1, by=1/(1+i))), length=i+2), family=poisson, data=ltHaz)
+
+dfGOF[MODi,1] <- modnames[[3]]
+dfGOF[MODi,2] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+dfGOF[MODi,3] <- extractAIC(glmTemp)[1]
+
+# Hazard estimates
+dfHazEst[MODi,] <- predict(glmTemp, newdata=Newtime, type="response")
+ltHaz[modnames[[3]]] <- predict(glmTemp, newdata=ltHaz, type="response")
+
+```
+
+```{r Royston and Parmar model, echo=TRUE}
+MODi <- 6
+MyAIC <- array(dim=c(6,3))
+MyBIC <- array(dim=c(6,3))
+MyScale <- list("hazard","odds","normal")
+for (i in 1:3){
+  for (j in 0:5){
+    MyTemp <- flexsurvspline(Surv(recyrs, censrec) ~ 1, data = gef_in, k = j, scale = MyScale[[i]])
+    MyAIC[[(i-1)*6+1+j]] <- (-2*MyTemp$loglik+2*MyTemp$npars)
+  }
+}
+MyAICResults <- as.data.frame(cbind(seq(1:6)-1,MyAIC))
+colnames(MyAICResults) <- c("Int.Knots","Hazard","Odds","Normal")
+best_rp_hazard<-which.min(MyAICResults$Hazard)
+best_rp_odds<-which.min(MyAICResults$Odds)
+best_rp_normal<-which.min(MyAICResults$Normal)  
+best_rp_scale<-which.min(c(MyAICResults$Hazard[best_rp_hazard],MyAICResults$Odds[best_rp_odds],MyAICResults$Normal[best_rp_normal])) 
+best_rp<-c(c("Hazard","Odds","Normal")[best_rp_scale],0) ### need adjust
+
+rp_scale<-MyScale[[best_rp_scale]]
+rp_k=0
+rpTemp <- flexsurvspline(Surv(recyrs, censrec) ~ 1, data = gef_in, k = rp_k, scale = rp_scale)
+rpAIC <- (-2*rpTemp$loglik+2*rpTemp$npars)
+
+dfHazEst[MODi,] <- summary(rpTemp, t=exp(Newtime$lnTime), type="hazard")[[1]]$est/12
+#plot(summary(rpTemp, t=exp(Newtime$lnTime), type="hazard")[[1]][,c("time","est")])#plot hazard
+
+ltHaz[modnames[[4]]] <- summary(rpTemp, t=ltHaz$Time, type="hazard")[[1]]$est/12
+
+dfGOF[MODi,1] <- modnames[[4]]
+dfGOF[MODi,2] <- sum(ltHaz$Events*log(ltHaz[modnames[[4]]]) - ltHaz[[modnames[[4]]]]*ltHaz$AtRisk) + llCons
+dfGOF[MODi,3] <- rpTemp$npars 
+
+##PS:k=0,scale=normal--lognormal dist
+
+```
+
+```{r Generalized Additive Models, echo=TRUE}
+MODi <- 7
+glmTemp <- gam(Events ~ s(lnTime, bs="cr", k=11, fx=FALSE) + offset(log(AtRisk)), knots=list(lnTime=quantile(log(gef2$recyrs), seq(from=0, to=1, by=1/10)), length=11), family=poisson, data=ltHaz)
+dfGOF[MODi,1] <- modnames[[5]]
+dfGOF[MODi,2] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+dfGOF[MODi,3] <- extractAIC(glmTemp)[1]
+dfHazEst[MODi,] <- predict(glmTemp, newdata=Newtime, type="response")
+ltHaz$GAM <- predict(glmTemp, newdata=ltHaz, type="response")
+
+# Now base knots on minimising AIC
+MODi <- 8
+myLnL <- array(dim=5)
+myAIC <- array(dim=5)
+for (i in 1:5){
+  glmTemp <- gam(Events ~ s(lnTime, bs="cr", k=i+2, fx=FALSE) + offset(log(AtRisk)), knots=list(lnTime=quantile(log(gef2$recyrs), seq(from=0, to=1, by=1/(1+i))), length=i+2), family=poisson, data=ltHaz)
+  myLnL[i] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+  myAIC[i] <- extractAIC(glmTemp)[2]
+}
+GAMres <- data.frame(c("One","Two","Three","Four","Five"))
+GAMres <- cbind(GAMres,myLnL,myAIC)
+colnames(GAMres) <- c("Int.Knots","LnL","AIC")
+which.min(GAMres$AIC) # 308.9374, for 2 internal knots
+i <- which.min(GAMres$AIC)
+glmTemp <- gam(Events ~ s(lnTime, bs="cr", k=i+2, fx=FALSE) + offset(log(AtRisk)), knots=list(lnTime=quantile(log(gef2$recyrs), seq(from=0, to=1, by=1/(1+i))), length=i+2), family=poisson, data=ltHaz)
+
+dfGOF[MODi,1] <- modnames[[6]]
+dfGOF[MODi,2] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+dfGOF[MODi,3] <- extractAIC(glmTemp)[1]
+
+# Hazard estimates
+dfHazEst[MODi,] <- predict(glmTemp, newdata=Newtime, type="response")
+ltHaz[modnames[[6]]] <- predict(glmTemp, newdata=ltHaz, type="response")
+
+```
+
+```{r Pairwaise model, echo=TRUE}
+#[PS: Do not use to Extrapolation]
+# ####  log cum haz plot  ###
+# 
+# # figloghr<-data.frame(ltHaz$Time,ltHaz$hazKM)
+# # figloghr<-rename(figloghr,"Time"="ltHaz.Time","haz"="ltHaz.hazKM")
+# # figloghr$logtime<-log(figloghr$Time)
+# # figloghr<-figloghr %>%
+# #   dplyr::arrange(logtime) %>%
+# #   dplyr::mutate(cumhaz = cumsum(haz))
+# # figloghr$logcumhaz<-log(figloghr$cumhaz)
+# # figloghr = figloghr %>% filter(logcumhaz != -Inf)
+# # 
+# # plot(figloghr$Time,figloghr$logcumhaz)
+
+gef_o<-read.csv("gef_data_origin.csv")
+gef_o<-gef_o %>%
+  dplyr::mutate(logtime = log(time)) %>%
+  dplyr::arrange(logtime) %>%
+  dplyr::mutate(haz = -log(os)) %>%
+  dplyr::mutate(cumhaz = cumsum(haz)) %>%
+  dplyr::mutate(logcumhaz = log(cumhaz))
+gef_o = gef_o %>% filter(logcumhaz != -Inf)
+plot(gef_o$time,gef_o$logcumhaz)
+
+gef_cumhr<-gef_in
+gef_cumhr$recmon<-gef_cumhr$recyrs*12
+fit_cumhr<-survfit(Surv(gef_cumhr$recmon,gef_cumhr$censrec)~1,data=gef_cumhr)
+ggsurvplot(fit_cumhr,fun="cumhaz",
+           xlim=c(0,48),
+           break.x.by=2)
+# ##  fit models  ##
+# # models <- list(
+# #   "PWE, cutpoint 12" = list(g1=function(x){as.numeric(x>12)},g2=function(x){0}),
+# #   "PWE, cutpoints 12 and 40" = list(g1=function(x){as.numeric(x>12&x<=40)},g2=function(x){as.numeric(x>40)}),
+# #   "PWE, cutpoints 40" = list(g1=function(x){as.numeric(x>40)},g2=function(x){0})
+# # )
+# # 
+# # #Fit all models
+# # fit.KM.NMA<-function(bf){
+# #   km.new=ltHaz
+# #   km.new$newTime=ltHaz$Time*12
+# #   # km.new=gef_in
+# #   # km.new$newTime=gef_in$recyrs*12
+# #   km.new$g1=bf[[1]](km.new$newTime)
+# #   km.new$g2=bf[[2]](km.new$newTime)
+# #   #model formula
+# #   # f=cbind(nevents,natrisk-nevents)~trtf*f0+studyf*g0+trtf*f1+trtf*f2+studyf*g1+studyf*g2
+# #   # glm(f,family=binomial(link=cloglog),data=km.new,offset = log(timeDelta))
+# #   #glm (Events ~ (g1+g2), offset=log(AtRisk), family=poisson, data=km.new)
+# #   # f=cbind(Events,AtRisk-Events)~ g1+g2
+# #   # f=cbind(Events,AtRisk-Events)~ g1+g2+newTime
+# #   # f=cbind(Events,AtRisk-Events)~ g1+g2+log(newTime)
+# #   # glm(f,family=binomial(link=cloglog),data=km.new)
+# #   #glm(f,family=quasibinomial(link=cloglog),data=km.new)
+# #   glm (Events ~ (g1+g2+log(newTime)), offset=log(AtRisk), family=poisson, data=km.new)
+# # }
+# # 
+# # fits=lapply(models,fit.KM.NMA)
+# 
+###   fit model posion dist   ###
+myLnL <- array(dim=9)
+myAIC <- array(dim=9)
+model_pw <- list(
+  "PWE, cutpoint 12" = list(g1=function(x){as.numeric(x>12)},g2=function(x){0}),
+  "PWE, cutpoints 12 and 40" = list(g1=function(x){as.numeric(x>12&x<=40)},g2=function(x){as.numeric(x>40)}),
+  "PWE, cutpoints 40" = list(g1=function(x){as.numeric(x>40)},g2=function(x){0}))
+# glm_model<-list(
+#   "glm_exp"=glm(Events ~ (g1+g2), offset=log(AtRisk), family=poisson, data=km.new),
+#  " glm_gom"=glm(Events ~ (g1+g2+newTime), offset=log(AtRisk), family=poisson, data=km.new),
+#   "glm_wei"=glm(Events ~ (g1+g2+log(newTime)), offset=log(AtRisk), family=poisson, data=km.new)
+# )
+
+for (i in 1 :3){
+  km.new=ltHaz
+  km.new$newTime=ltHaz$Time*12
+  km.new$g1=model_pw[[i]][[1]](km.new$newTime)
+  km.new$g2=model_pw[[i]][[2]](km.new$newTime)
+  glm_exp<-glm(Events ~ (g1+g2), offset=log(AtRisk), family=poisson, data=km.new)
+  glm_gom<-glm(Events ~ (g1+g2+newTime), offset=log(AtRisk), family=poisson, data=km.new)
+  glm_wei<-glm(Events ~ (g1+g2+log(newTime)), offset=log(AtRisk), family=poisson, data=km.new)
+  #AIC exp
+  myLnL[i] <- (extractAIC(glm_exp)[2] - 2*extractAIC(glm_exp)[1])*(-0.5)
+  myAIC[i] <- extractAIC(glm_exp)[2]
+  #AIC gompertz
+  myLnL[i+3] <- (extractAIC(glm_gom)[2] - 2*extractAIC(glm_gom)[1])*(-0.5)
+  myAIC[i+3] <- extractAIC(glm_gom)[2]
+  #AIC weibull
+  myLnL[i+6] <- (extractAIC(glm_wei)[2] - 2*extractAIC(glm_wei)[1])*(-0.5)
+  myAIC[i+6] <- extractAIC(glm_wei)[2]
+}
+
+PWres <- data.frame(c("exp-12","exp-12&40","exp-40","gompertz-12","gompertz-12&40",
+                       "gompertz-40","weibull-12","weibull-12&40","weibull-40"))
+PWres <- cbind(PWres,myLnL,myAIC)
+colnames(PWres) <- c("Name","LnL","AIC")
+##choose 
+#choose exp cutoff>12
+#choose gompertz cutoff>40
+#choose weibull cutoff>40
+
+#exp
+km.new=ltHaz
+km.new$newTime=ltHaz$Time*12
+km.new$g1=model_pw[[1]][[1]](km.new$newTime)
+km.new$g2=model_pw[[1]][[2]](km.new$newTime)
+pw_best_exp<-glm(Events ~ (g1+g2), offset=log(AtRisk), family=poisson, data=km.new)
+MODi <- 9
+dfGOF[MODi,1] <- "PW exp"
+dfGOF[MODi,2] <- (extractAIC(pw_best_exp)[2] - 2*extractAIC(pw_best_exp)[1])*(-0.5)
+dfGOF[MODi,3] <- extractAIC(pw_best_exp)[1]
+#gompertz
+km.new=ltHaz
+km.new$newTime=ltHaz$Time*12
+km.new$g1=model_pw[[3]][[1]](km.new$newTime)
+km.new$g2=model_pw[[3]][[2]](km.new$newTime)
+pw_best_gom<-glm(Events ~ (g1+g2+newTime), offset=log(AtRisk), family=poisson, data=km.new)
+MODi <- 10
+dfGOF[MODi,1] <- "PW gompertz"
+dfGOF[MODi,2] <- (extractAIC(pw_best_gom)[2] - 2*extractAIC(pw_best_gom)[1])*(-0.5)
+dfGOF[MODi,3] <- extractAIC(pw_best_gom)[1]
+#weibull
+km.new=ltHaz
+km.new$newTime=ltHaz$Time*12
+km.new$g1=model_pw[[3]][[1]](km.new$newTime)
+km.new$g2=model_pw[[3]][[2]](km.new$newTime)
+pw_best_wei<-glm(Events ~ (g1+g2+log(newTime)), offset=log(AtRisk), family=poisson, data=km.new)
+MODi <- 11
+dfGOF[MODi,1] <- "PW weibull"
+dfGOF[MODi,2] <- (extractAIC(pw_best_wei)[2] - 2*extractAIC(pw_best_wei)[1])*(-0.5)
+dfGOF[MODi,3] <- extractAIC(pw_best_wei)[1]
+
+# ##predict PW
+# dfGOF[MODi,1] <- modnames[[7]]
+# dfGOF[MODi,2] <- (extractAIC(pw_best)[2] - 2*extractAIC(pw_best)[1])*(-0.5)
+# dfGOF[MODi,3] <- extractAIC(pw_best)[1]
+# new data for predict
+pw_olddata<-filter(Newtime,MyId<=40)
+pw_newdata<-Newtime
+pw_newdata$newTime<-exp(pw_newdata$lnTime)*12
+pw_newdata<-subset(pw_newdata, select = -lnTime )
+pw_newdata$g1=model_pw[[1]][[1]](pw_newdata$newTime)
+pw_newdata$g2=model_pw[[1]][[2]](pw_newdata$newTime)
+pw_newdata<-rename(pw_newdata,"Events"="EventsL")
+# Hazard estimates
+km.new=ltHaz
+km.new$g1=model_pw[[1]][[1]](km.new$Time)
+km.new$g2=model_pw[[1]][[2]](km.new$Time)
+
+y1<-function(x){
+  exp(-4.5168+0.8899*x)
+}
+
+y2<-function(x){
+  exp(-4.7341-0.66479*x+0.04244*x)
+}
+
+y3<-function(x){
+  exp(-6.0632-0.4226*x+0.7794*log(x))
+}
+
+hazpw<-as.data.frame(matrix(nrow=48,ncol=4))
+colnames(hazpw)<-c("time","hazexp","hazgom","hazwei")
+hazpw$time<-ltHaz$Time
+hazpw$hazexp<-y1(hazpw$time)
+hazpw$hazgom<-y2(hazpw$time)
+hazpw$hazwei<-y3(hazpw$time)
+
+km.new<-ltHaz
+km.new$newtime<-ltHaz$Time*12
+hazkm12<-subset(km.new,newtime<12)
+hazkm12<-hazkm12$hazKM
+hazkm40<-subset(km.new,newtime<40)
+hazkm40<-hazkm40$hazKM
+
+for (i in 1:12) {
+  hazpw$hazexp[i]<-hazkm12[i]
+}
+
+for (i in 1:40) {
+  hazpw$hazgom[i]<-hazkm40[i]
+}
+
+for (i in 1:40) {
+  hazpw$hazwei[i]<-hazkm40[i]
+}
+
+ltHaz$PW_exp <- hazpw$hazexp
+ltHaz$PW_gompertz <- hazpw$hazgom
+ltHaz$PW_weibull <- hazpw$hazwei
+
+```
+
+```{r Mixture Model, echo=TRUE}
+#  Code Reference:  #
+#-----------------------------------------------------------#
+# Authors and copyright:                                    #
+# Sven Klijn, Marjanne Piena, Sonja Kroep, Craig Bennison   #
+# Pharmerit - an OPEN Health company                        #
+# November 2020                                             #
+#-----------------------------------------------------------#
+##text2
+  
+flexsurvmixture <- function(formula, dists, control, sr.control){
+  
+  n.groups <- length(dists)
+  
+  dist_list                 <- list()
+  dist_list$name            <- paste0(n.groups,"groups: ",paste0(dists,"_", collapse=""))
+  dist_list$pars            <- do.call(compile.pars, args = list(dists, n.groups))
+  dist_list$location        <- "p1"
+  dist_list$transforms      <- do.call(compile.transform, args = list(dists, n.groups))
+  dist_list$inv.transforms  <- do.call(compile.inv.transform, args = list(dists, n.groups))
+  dist_list$inits           <- function(t){do.call(compile.inits, args = list(t = t, dists, n.groups))}
+  
+  pfun <- dfun <- list()
+  for(i in 1:n.groups){
+    pfun[[i]] = get(paste0("p", dists[i]))
+    dfun[[i]] = get(paste0("d", dists[i]))
+  }
+  
+  dfns_list = list(
+    p = function(q, ...) pmixsurv(pfun, q, n.groups, ...),
+    d = function(x, ...) dmixsurv(dfun, x, n.groups, ...),
+    mean = function(...) mean_mixsurv(pfun, ...),
+    rmst = function(t, ...) rmst_mixsurv(pfun, t, ...) 
+  )
+  
+  optim <- list()
+  out <- do.call(
+    "flexsurvreg",
+    append(
+      list(
+        formula,
+        dist = dist_list,
+        dfns = dfns_list,
+        control = control, 
+        sr.control = sr.control
+      ),
+      optim
+    )
+  )
+  return(out)
+}
+pmixsurv = function(pfun, q, n.groups, ...) {
+  dots <- list(...)
+  args <- dots
+  args$lower.tail <- F
+  args$log.p <- F
+  
+  theta                     <- c()
+  theta[1]                  <- args$p1; args$p1 <- NULL
+  if(n.groups > 2){theta[2] <- args$p2; args$p2 <- NULL}
+  if(n.groups > 3){theta[3] <- args$p3; args$p3 <- NULL}
+  theta <- multinom.p(theta)
+  
+  args1 <- args; args1[(endsWith(names(args1), "2") | endsWith(names(args1), "3") | endsWith(names(args1), "4"))] <- NULL
+  args2 <- args; args2[(endsWith(names(args2), "1") | endsWith(names(args2), "3") | endsWith(names(args2), "4"))] <- NULL
+  args3 <- args; args3[(endsWith(names(args3), "1") | endsWith(names(args3), "2") | endsWith(names(args3), "4"))] <- NULL
+  args4 <- args; args4[(endsWith(names(args4), "1") | endsWith(names(args4), "2") | endsWith(names(args4), "3"))] <- NULL
+  
+  names(args1)[endsWith(names(args1), "1")] <- gsub("1", "", names(args1)[endsWith(names(args1), "1")])
+  names(args2)[endsWith(names(args2), "2")] <- gsub("2", "", names(args2)[endsWith(names(args2), "2")])
+  names(args3)[endsWith(names(args3), "3")] <- gsub("3", "", names(args3)[endsWith(names(args3), "3")])
+  names(args4)[endsWith(names(args4), "4")] <- gsub("4", "", names(args4)[endsWith(names(args4), "4")])
+  
+  out <- (theta[1] * do.call(pfun[[1]], append(list(q), args1)) + 
+            theta[2] * do.call(pfun[[2]], append(list(q), args2)) +
+            ifelse(n.groups>2, theta[3] * do.call(pfun[[3]], append(list(q), args3)),0) +
+            ifelse(n.groups>3, theta[4] * do.call(pfun[[4]], append(list(q), args4)),0)) 
+  
+  if (is.null(dots$lower.tail) || dots$lower.tail) {
+    out <- 1 - out
+  }
+  if (!is.null(dots$log.p) && dots$log.p) {
+    out <- log(out)
+  }
+  return(out)
+}
+dmixsurv = function(dfun, x, n.groups, ...) {
+  dots <- list(...)
+  args <- dots
+  args$log <- F
+  
+  theta                     <- c()
+  theta[1]                  <- args$p1; args$p1 <- NULL
+  if(n.groups > 2){theta[2] <- args$p2; args$p2 <- NULL}
+  if(n.groups > 3){theta[3] <- args$p3; args$p3 <- NULL}
+  theta <- multinom.p(theta)
+  
+  args1 <- args; args1[(endsWith(names(args1), "2") | endsWith(names(args1), "3") | endsWith(names(args1), "4"))] <- NULL
+  args2 <- args; args2[(endsWith(names(args2), "1") | endsWith(names(args2), "3") | endsWith(names(args2), "4"))] <- NULL
+  args3 <- args; args3[(endsWith(names(args3), "1") | endsWith(names(args3), "2") | endsWith(names(args3), "4"))] <- NULL
+  args4 <- args; args4[(endsWith(names(args4), "1") | endsWith(names(args4), "2") | endsWith(names(args4), "3"))] <- NULL
+  
+  names(args1)[endsWith(names(args1), "1")] <- gsub("1", "", names(args1)[endsWith(names(args1), "1")])
+  names(args2)[endsWith(names(args2), "2")] <- gsub("2", "", names(args2)[endsWith(names(args2), "2")])
+  names(args3)[endsWith(names(args3), "3")] <- gsub("3", "", names(args3)[endsWith(names(args3), "3")])
+  names(args4)[endsWith(names(args4), "4")] <- gsub("4", "", names(args4)[endsWith(names(args4), "4")])
+  
+  
+  out <- (theta[1] * do.call(dfun[[1]], append(list(x), args1)) + 
+            theta[2] * do.call(dfun[[2]], append(list(x), args2)) +  
+            ifelse(n.groups>2,theta[3] * do.call(dfun[[3]], append(list(x), args3)),0) + 
+            ifelse(n.groups>3,theta[4] * do.call(dfun[[4]], append(list(x), args4)),0))
+  
+  if (!is.null(dots$log) && dots$log) {
+    out <- log(out)
+  }
+  return(out)
+}
+rmst_mixsurv = function(pfun, q, t, ...) {
+  args <- list(...)
+  out <- do.call(
+    rmst_generic,
+    append(
+      list(
+        function(q, ...) pmixsurv(pfun, q, ...),
+        t = t
+      ),
+      args
+    )
+  )
+  return(out)
+}
+mean_mixsurv = function(pfun, ...) {
+  if(p1 > 0) {
+    out <- Inf
+  }else {
+    args <- list(...)
+    out <- do.call(
+      rmst_generic,
+      append(
+        list(
+          pfun[[1]],
+          t = Inf,
+          start = 0
+        ),
+        args
+      )
+    )
+  }
+  return(out)
+}
+multinom.p = function(theta) {
+  p <- rep(NA,length(theta) + 1)
+  for (i in 1:length(theta)) {
+    p[i] <- exp(theta[i])/(1 + sum(exp(theta)))
+  }
+  p[length(theta) + 1] <- 1 / (1 + sum(exp(theta)))
+  return(p)
+}
+#exp
+exp.inits <- function(t) {
+  1/mean(t)
+}
+exp.pars <- flexsurv.dists$exp$pars
+exp.t <- list(log)
+exp.it <- list(exp)
+#gamma
+gamma.inits <- function(t) {
+  m = mean(t)
+  v = var(t)
+  c(m^2/v, m/v)
+}
+gamma.pars <- flexsurv.dists$gamma$pars
+gamma.t <- list(log, log)
+gamma.it <- list(exp, exp)
+#gen gamma
+gengamma.inits <- function(t) {
+  lt <- log(t[t > 0])
+  c(mean(lt), sd(lt), 0)
+}
+gengamma.pars <- flexsurv.dists$gengamma$pars
+gengamma.t <- list(identity, log, identity)
+gengamma.it <- list(identity, exp, identity)
+#gompertz
+gompertz.inits <- function(t) {
+  c(0.001, 1/mean(t))
+}
+gompertz.pars <- flexsurv.dists$gompertz$pars
+gompertz.t <- list(identity, log)
+gompertz.it <- list(identity, exp)
+#llogis
+llogis.inits <- function(t) {
+  scale <- median(t)
+  shape <- 1/log(quantile(t, 0.25)/scale, base = 3)
+  if (shape < 0) 
+    shape <- 1
+  c(shape, scale)
+}
+llogis.pars <- flexsurv.dists$llogis$pars
+llogis.t <- list(log, log)
+llogis.it <- list(exp, exp)
+#lnorm
+lnorm.inits <- function(t) {
+  lt <- log(t[t > 0])
+  c(mean(lt), sd(lt))
+}
+lnorm.pars <- flexsurv.dists$lnorm$pars
+lnorm.t <- list(identity, log)
+lnorm.it <- list(identity, exp)
+#weibull
+weibull.inits <- function(t) {
+  lt <- log(t[t > 0])
+  c(1.2/var(lt), exp(mean(lt) + 0.572)) 
+}
+weibull.pars <- flexsurv.dists$weibull$pars
+weibull.t <- list(log, log)
+weibull.it <- list(exp, exp)
+#compile
+compile.inits <- function(t, group.dists, n.groups) {
+  if(n.groups >= 1) inits.groups <- rep(0.01, n.groups - 1)
+  inits1 <- get(paste0(group.dists[1], ".inits"))
+  if(!is.na(group.dists[2])) inits2 <- get(paste0(group.dists[2], ".inits")) else inits2 <- function(t){NULL}
+  if(!is.na(group.dists[3])) inits3 <- get(paste0(group.dists[3], ".inits")) else inits3 <- function(t){NULL}
+  if(!is.na(group.dists[4])) inits4 <- get(paste0(group.dists[4], ".inits")) else inits4 <- function(t){NULL}
+  if(n.groups == 1) return(inits1(t))
+  if(n.groups == 2) return(c(inits.groups, inits1(t), inits2(t)))
+  if(n.groups == 3) return(c(inits.groups, inits1(t), inits2(t), inits3(t)))
+  if(n.groups == 4) return(c(inits.groups, inits1(t), inits2(t), inits3(t), inits4(t)))
+  if(n.groups >= 4) stop("too many distributions specified, use 4 groups or fewer")
+}
+compile.pars <- function(group.dists, n.groups) {
+  pars.groups = NULL
+  if(n.groups >= 1) for(i in 1:(n.groups-1)) pars.groups[i] <- paste0("p",i)
+  pars1 <- paste0(get(paste0(group.dists[1], ".pars")),1)
+  if(!is.na(group.dists[2])) pars2 <- paste0(get(paste0(group.dists[2], ".pars")),2) else pars2 <- function(){NULL}
+  if(!is.na(group.dists[3])) pars3 <- paste0(get(paste0(group.dists[3], ".pars")),3) else pars3 <- function(){NULL}
+  if(!is.na(group.dists[4])) pars4 <- paste0(get(paste0(group.dists[4], ".pars")),4) else pars4 <- function(){NULL}
+  if(n.groups == 1) return(pars1)
+  if(n.groups == 2) return(c(pars.groups, pars1, pars2))
+  if(n.groups == 3) return(c(pars.groups, pars1, pars2, pars3))
+  if(n.groups == 4) return(c(pars.groups, pars1, pars2, pars3, pars4))
+  if(n.groups >= 4) stop("too many distributions specified, use 4 groups or fewer")
+}
+compile.transform <- function(group.dists, n.groups) {
+  tgroups = list(NULL)
+  if(n.groups >= 1) for(i in 1:(n.groups-1)) tgroups[[i]] <- identity
+  t1 <- get(paste0(group.dists[1], ".t"))
+  if(!is.na(group.dists[2])) t2 <- get(paste0(group.dists[2], ".t")) else t2 <- function(){NULL}
+  if(!is.na(group.dists[3])) t3 <- get(paste0(group.dists[3], ".t")) else t3 <- function(){NULL}
+  if(!is.na(group.dists[4])) t4 <- get(paste0(group.dists[4], ".t")) else t4 <- function(){NULL}
+  if(n.groups == 1) return(t1)
+  if(n.groups == 2) return(c(tgroups, t1, t2))
+  if(n.groups == 3) return(c(tgroups, t1, t2, t3))
+  if(n.groups == 4) return(c(tgroups, t1, t2, t3, t4))
+  if(n.groups >= 4) stop("too many distributions specified, use 4 groups or fewer")
+}
+compile.inv.transform <- function(group.dists, n.groups) {
+  itgroups = list(NULL)
+  if(n.groups >= 1) for(i in 1:(n.groups-1)) itgroups[[i]] <- identity
+  it1 <- get(paste0(group.dists[1], ".it"))
+  if(!is.na(group.dists[2])) it2 <- get(paste0(group.dists[2], ".it")) else it2 <- function(){NULL}
+  if(!is.na(group.dists[3])) it3 <- get(paste0(group.dists[3], ".it")) else it3 <- function(){NULL}
+  if(!is.na(group.dists[4])) it4 <- get(paste0(group.dists[4], ".it")) else it4 <- function(){NULL}
+  if(n.groups == 1) return(it1)
+  if(n.groups == 2) return(c(itgroups, it1, it2))
+  if(n.groups == 3) return(c(itgroups, it1, it2, it3))
+  if(n.groups == 4) return(c(itgroups, it1, it2, it3, it4))
+  if(n.groups >= 4) stop("too many distributions specified, use 4 groups or fewer")
+}
+
+## simulate results ##
+#newdata
+gef_MM<-gef_in
+gef_MM$rectime2<-as.numeric(gef_MM$recyrs*12) 
+gef_MM$recyrs<-as.numeric(gef_MM$recyrs)
+survgef <- Surv(time=gef_MM$rectime2 , event=gef_MM$censrec==1)
+plot(survgef)
+
+# dists list #
+dists_MM<-as.data.frame(matrix(nrow=28,ncol=2))
+colnames(dists_MM)<-c("dist1",'dist2')
+distlist<-c("exp","weibull","gamma","lnorm","gompertz","llogis","gengamma")
+
+index1<-1
+for (i in 1:7) {
+  for (j in i:7){
+    dists_MM$dist1[index1]<- distlist[i]
+    dists_MM$dist2[index1]<- distlist[j]
+    index1<-index1+1
+  }
+}
+
+myAIC <- array(dim=28)
+for (i in 1:28) {
+  mixfit <- flexsurvmixture(survgef ~ 1, dists = c(dists_MM$dist1[i],dists_MM$dist2[i]), control = list(reltol = 1e-8), sr.control= list(reltol = 1e-8))
+  myAIC[i] <- (-2*mixfit$loglik+2*mixfit$npars)
+}
+which.min(myAIC)
+dists_MM[which.min(myAIC),]##gompertz,gengamma,best;AIC=254.95
+MMres<-cbind(dists_MM,myAIC)
+MMres<-arrange(MMres,myAIC) 
+
+# best mixture model
+mixfit <- flexsurvmixture(survgef ~ 1, dists = c("lnorm","gompertz"), control = list(reltol = 1e-8), sr.control= list(reltol = 1e-8))
+#mixfit <- flexsurvmixture(survgef ~ 1, dists = c("llogis","gengamma"), control = list(reltol = 1e-8), sr.control= list(reltol = 1e-8))
+
+# Plot mixture model
+## KM curve
+plot(survgef)
+## Component 1: weibull
+lines(seq.int(max(48)), 1-plnorm(seq.int(48), mixfit$res[2],mixfit$res[3]), col = "blue", lwd = 1)
+## Component 2: gengamma
+lines(seq.int(48), 1-pgompertz(seq.int(48), mixfit$res[4], mixfit$res[5]), col = "cyan", lwd = 1)
+## Mixture model
+lines(summary(mixfit, t = seq.int(48))[[1]][,c("time", "est")], col = "red", lwd = 2)
+# write data
+MODi<-12
+
+MM_Newtime<-Newtime
+MM_Newtime$time<-exp(MM_Newtime$lnTime)*12
+dfHazEst[MODi,]<-summary(mixfit, t = MM_Newtime$time,type="hazard")[[1]]$est
+ltHaz[modnames[[8]]] <- summary(mixfit, t=ltHaz$Time*12,type="hazard")[[1]]$est
+
+dfGOF[MODi,1] <- modnames[[8]]
+dfGOF[MODi,2] <- sum(ltHaz$Events*log(ltHaz[modnames[[8]]]) - ltHaz[[modnames[[8]]]]*ltHaz$AtRisk) + llCons
+dfGOF[MODi,3] <- mixfit$npars 
+
+```
+
+########################################################################################## 
+
+############# Cure Model
+
+########################################################################################## 
+
+##content #1.prepare data #2. cure mixture #3. write data #4. cure
+nmixture #5. write data
+###------------------------------------------------------------------------------------###
+
+```{r prepare cure data, echo=TRUE}
+df_cure<-data.frame(gef$recyrs,4,gef_in$censrec,gef_in$recyrs)
+colnames(df_cure)<-c("Tru_surv","Follow_Up","Censor","Obs_surv")
+## general cure rate
+# Function to convert between rates and probability
+haz_rate = function(x, t, out = "prob"){ 
+  tmp  = t - lag(t, default = 0)
+  if (out == "rate"){
+    y = case_when(x == 1 ~ 1, TRUE ~ - (log(1 - x)) / tmp)
+  } else if (out == "prob") {
+    y = 1 - exp(- x * tmp)
+  } else {
+    "error!"
+  }
+  return (y)
+}
+# England 2016
+Eng_HMD = read.table(here("HMD", "UK_HMDv2.txt"), header=TRUE)
+Eng_2016 = filter(Eng_HMD, Year == 2016) %>% mutate(tmp = Age,
+                                                    Age = as.numeric(tmp)[tmp],
+                                                    Hazard = haz_rate(qx, 1, "rate"),  # All observations 1 unit apart
+                                                    Surv = (lx - dx) / lx[1],
+                                                    Years = Age - 64)
+tmp = select(Eng_2016, Year, Age, Hazard)
+
+# general information
+my_time<-ltHaz$Time
+my_time2<-exp(Newtime$lnTime)
+df_GP1 = tibble(Time = my_time, 
+               Haz_pop = approx(x = Eng_2016$Years, y = Eng_2016$Hazard, xout = my_time, method = "constant")$y,
+               Srv_pop = approx(x = Eng_2016$Years, y = Eng_2016$Surv, xout = my_time, method = "constant")$y)
+df_GP2 = tibble(Time = my_time2, 
+                Haz_pop = approx(x = Eng_2016$Years, y = Eng_2016$Hazard, xout = my_time2, method = "constant")$y,
+                Srv_pop = approx(x = Eng_2016$Years, y = Eng_2016$Surv, xout = my_time2, method = "constant")$y)
+# ipd data
+#my_time = seq(from=0.25, to=7.5, by=0.05) # Time values for which we want estimates.
+my_df_ipd<-df_cure
+my_df_ipd=my_df_ipd %>% mutate(Year = 2016, Age = floor(64 + Obs_surv))
+my_df_ipd<-left_join(my_df_ipd, tmp, by = c("Year", "Age"))
+
+```
+
+```{r mixture cure model--CuRe, echo=TRUE}
+### weibull CuRe
+df <- my_df_ipd
+best_wei <- fit.cure.model(Surv(Obs_surv, Censor) ~ 1, data = df, bhazard = "Hazard",formula.surv = list(~ 1, ~ 1), dist = "weibull")
+my_aic <- 2*(length(best_wei$coefs) + best_wei$ML)
+cure_p <- predict(best_wei, type = "curerate")[[1]]$Estimate
+#   Save data on hazard and survival for those with disease (uncured)
+df <- tibble(Time = my_time, Srv_dis = predict(best_wei, type = "survuncured", time = my_time)[[1]]$Estimate,
+              Haz_dis = predict(best_wei, type = "hazarduncured", time = my_time)[[1]]$Estimate)
+  
+cuRe_wei <- list(df = df, AIC = my_aic, cure_p = cure_p)
+### Lnorm CuRe
+df <- my_df_ipd
+best_lnorm <- fit.cure.model(Surv(Obs_surv, Censor) ~ 1, data = df, bhazard = "Hazard",formula.surv = list(~ 1, ~ 1), dist = "lognormal")
+my_aic <- 2*(length(best_lnorm$coefs) + best_lnorm$ML)
+cure_p <- predict(best_lnorm, type = "curerate")[[1]]$Estimate
+#   Save data on hazard and survival for those with disease (uncured)
+df = tibble(Time = my_time, Srv_dis = predict(best_lnorm, type = "survuncured", time = my_time)[[1]]$Estimate,
+              Haz_dis = predict(best_lnorm, type = "hazarduncured", time = my_time)[[1]]$Estimate)
+  
+cuRe_lnorm<- list(df = df, AIC = my_aic, cure_p = cure_p)
+###------------###
+###  RP CuRe   ###
+###------------###
+max_k<-5
+df <- my_df_ipd
+my_k = 1
+myAIC <- array(dim=5)
+for(i in 1:max_k){
+  tmp = GenFlexCureModel(Surv(Obs_surv, Censor) ~ 1, data = df, bhazard = "Hazard", df= i, verbose = FALSE)
+  tmp_AIC = 2*(length(tmp$coefs) + length(tmp$coefs.spline) + tmp$NegMaxLik)
+  myAIC[i]<-tmp_AIC
+}
+which.min(myAIC)
+myAIC[which.min(myAIC)]#k=1,best,AIC=253.6163
+
+best_RP<-GenFlexCureModel(Surv(Obs_surv, Censor) ~ 1, data = df, bhazard = "Hazard", df= 1, verbose = FALSE)
+my_aic<-2*(length(best_RP$coefs) + length(best_RP$coefs.spline) + best_RP$NegMaxLik)
+cure_p <- predict(best_RP, type = "curerate")[[1]]$Estimate
+  # Save data on hazard and survival for those with disease (uncured)
+df = tibble(Time = my_time, Srv_dis = predict(best_RP, type = "survuncured", time = my_time)[[1]]$Estimate,
+              Haz_dis = predict(best_RP, type = "hazarduncured", time = my_time)[[1]]$Estimate)
+  
+cuRe_RP <- list(df = df, AIC = my_aic,cure_p = cure_p)
+AIC_cuRe<-c(cuRe_wei$AIC,cuRe_lnorm$AIC,cuRe_RP$AIC)
+which.min(AIC_cuRe)
+
+#--------------------------------------#
+###best model for CuRe mixture---lnorm
+
+df <- my_df_ipd
+best_mix <- fit.cure.model(Surv(Obs_surv, Censor) ~ 1, data = df, bhazard = "Hazard",formula.surv = list(~ 1, ~ 1), dist = "lognormal")
+my_aic <- 2*(length(best_mix$coefs) + best_mix$ML)
+cure_p <- predict(best_mix, type = "curerate")[[1]]$Estimate
+#   Save data on hazard and survival for those with disease (uncured)
+df1 = tibble(Time = my_time, Srv_dis = predict(best_mix, type = "survuncured", time = my_time)[[1]]$Estimate,
+            Haz_dis = predict(best_mix, type = "hazarduncured", time = my_time)[[1]]$Estimate)
+
+## lthaz  ##
+## Add general population hazard and survival, derive overall model estimates.
+df_mod_1 <- left_join(df1, df_GP1, by = "Time") %>% mutate(Srv_mod = Srv_pop * cure_p + Srv_dis * (1 - cure_p),
+                                                        Pred = (Haz_pop * Srv_pop * cure_p + Haz_dis * Srv_dis * (1 - cure_p)) /
+                                                          (Srv_pop * cure_p + Srv_dis * (1 - cure_p)))
+##  dfhazest  ##
+df2 = tibble(Time = my_time2, Srv_dis = predict(best_mix, type = "survuncured", time = my_time2)[[1]]$Estimate,
+            Haz_dis = predict(best_mix, type = "hazarduncured", time = my_time2)[[1]]$Estimate)
+df_mod_2 <- left_join(df2, df_GP2, by = "Time") %>% mutate(Srv_mod = Srv_pop * cure_p + Srv_dis * (1 - cure_p),
+                                                       Pred = (Haz_pop * Srv_pop * cure_p + Haz_dis * Srv_dis * (1 - cure_p)) /
+                                                         (Srv_pop * cure_p + Srv_dis * (1 - cure_p)))
+# write data
+MODi<-13
+dfHazEst[MODi,]<-df_mod_2$Pred
+ltHaz[modnames[[9]]] <- df_mod_1$Pred
+surv_cure_mix<-df_mod_2$Srv_mod
+
+dfGOF[MODi,1] <- modnames[[9]]
+dfGOF[MODi,2] <- -best_mix$ML
+dfGOF[MODi,3] <- length(best_mix$coefs) 
+
+```
+
+```{r non mixture cure model --CuRe, echo=TRUE}
+# PS: OS still has problem ---- 2022/2/11  How to calculate
+### Wei CuRe
+df <- my_df_ipd
+best_wei <- fit.cure.model(Surv(Obs_surv, Censor) ~ 1, type = "nmixture",link= "loglog",data = df, bhazard = "Hazard",formula.surv = list(~ 1, ~ 1), dist = "weibull")
+my_aic <- 2*(length(best_wei$coefs) + best_wei$ML)
+cure_p <- predict(best_wei, type = "curerate")[[1]]$Estimate
+#   Save data on hazard and survival for those with disease (uncured)
+df <- tibble(Time = my_time, Srv_dis = predict(best_wei, type = "survuncured", time = my_time)[[1]]$Estimate,
+             Haz_dis = predict(best_wei, type = "hazarduncured", time = my_time)[[1]]$Estimate)
+
+cuRe_wei <- list(df = df, AIC = my_aic, cure_p = cure_p)
+
+### Lnorm CuRe
+df <- my_df_ipd
+best_lnorm <- fit.cure.model(Surv(Obs_surv, Censor) ~ 1, type = "nmixture", link= "loglog", data = df, bhazard = "Hazard",formula.surv = list(~ 1, ~ 1), dist = "lognormal")
+my_aic <- 2*(length(best_lnorm$coefs) + best_lnorm$ML)
+cure_p <- predict(best_lnorm, type = "curerate")[[1]]$Estimate
+#   Save data on hazard and survival for those with disease (uncured)
+df = tibble(Time = my_time, Srv_dis = predict(best_lnorm, type = "survuncured", time = my_time)[[1]]$Estimate,
+            Haz_dis = predict(best_lnorm, type = "hazarduncured", time = my_time)[[1]]$Estimate)
+
+cuRe_lnorm<- list(df = df, AIC = my_aic, cure_p = cure_p)
+###  RP CuRe
+max_k<-5
+df <- my_df_ipd
+myAIC <- array(dim=5)
+for(i in 1:max_k){
+  tmp = GenFlexCureModel(Surv(Obs_surv, Censor) ~ 1, type = "nmixture", link.type.cr = "loglog", data = df, bhazard = "Hazard", df= i, verbose = FALSE)
+  tmp_AIC = 2*(length(tmp$coefs) + length(tmp$coefs.spline) + tmp$NegMaxLik)
+  myAIC[i]<-tmp_AIC
+}
+which.min(myAIC)
+myAIC[which.min(myAIC)] #k=1,best,AIC=253.4092
+
+best_RP<-GenFlexCureModel(Surv(Obs_surv, Censor) ~ 1, type = "nmixture", data = df, bhazard = "Hazard", df= 1, verbose = FALSE)
+my_aic<-2*(length(best_RP$coefs) + length(best_RP$coefs.spline) + best_RP$NegMaxLik)
+cure_p <- predict(best_RP, type = "curerate")[[1]]$Estimate
+# Save data on hazard and survival for those with disease (uncured)
+df = tibble(Time = my_time, Srv_dis = predict(best_RP, type = "survuncured", time = my_time)[[1]]$Estimate,
+            Haz_dis = predict(best_RP, type = "hazarduncured", time = my_time)[[1]]$Estimate)
+
+cuRe_RP <- list(df = df, AIC = my_aic,cure_p = cure_p)
+AIC_cuRe<-c(cuRe_wei$AIC,cuRe_lnorm$AIC,cuRe_RP$AIC)
+which.min(AIC_cuRe)
+
+#--------------------------------------#
+###best model for CuRe nmixture---lnorm
+
+df <- my_df_ipd
+best_mix <- fit.cure.model(Surv(Obs_surv, Censor) ~ 1, type = "nmixture", link= "loglog", data = df, bhazard = "Hazard",formula.surv = list(~ 1, ~ 1), dist = "lognormal")
+my_aic <- 2*(length(best_mix$coefs) + best_mix$ML)
+cure_p <- predict(best_mix, type = "curerate")[[1]]$Estimate
+#   Save data on hazard and survival for those with disease (uncured)
+df1 = tibble(Time = my_time, Srv_dis = predict(best_mix, type = "survuncured", time = my_time)[[1]]$Estimate,
+             Haz_dis = predict(best_mix, type = "hazarduncured", time = my_time)[[1]]$Estimate)
+
+## lthaz  ##
+## Add general population hazard and survival, derive overall model estimates.
+df_mod_1 <- left_join(df1, df_GP1, by = "Time") %>% mutate(Srv_mod = Srv_pop*cure_p^(1-Srv_dis),
+                                                           Pred = Haz_pop-log(cure_p)*Haz_dis*Srv_dis)
+
+##  dfhazest  ##
+df2 = tibble(Time = my_time2, Srv_dis = predict(best_mix, type = "survuncured", time = my_time2)[[1]]$Estimate,
+             Haz_dis = predict(best_mix, type = "hazarduncured", time = my_time2)[[1]]$Estimate)
+df_mod_2 <- left_join(df2, df_GP2, by = "Time") %>% mutate(Srv_mod = Srv_pop*cure_p^(1-Srv_dis),
+                                                           Pred = Haz_pop-log(cure_p)*Haz_dis*Srv_dis)
+# write data
+MODi<-14
+dfHazEst[MODi,]<-df_mod_2$Pred
+ltHaz[modnames[[10]]] <- df_mod_1$Pred
+surv_cure_nmix<-df_mod_2$Srv_mod
+
+dfGOF[MODi,1] <- modnames[[10]]
+dfGOF[MODi,2] <- -best_mix$ML
+dfGOF[MODi,3] <- length(best_mix$coefs) 
+
+```
+
+```{r cure model--flexsurvcure, echo=TRUE}
+#A new calculate method almost the same with CuRe
+myLnL <- array(dim=4)
+myPram<-array(dim=4)
+myAIC <- array(dim=4)
+
+###-----------------------------------------------------###
+###               mixture  cure   model
+###-----------------------------------------------------###
+### weibull CuRe
+df <- my_df_ipd
+best_wei <- flexsurvcure(Surv(Obs_surv, Censor) ~ 1, data = df, link="logistic", bhazard = Hazard,mixture=T, dist = "weibull")
+myLnL[1] <- best_wei$loglik
+myPram[1]<-best_wei$npars
+myAIC[1] <- best_wei$AIC
+S_wei<-summary(best_wei,type="survival",t=my_time)
+#plot(S_wei[[1]]$time,S_wei[[1]]$est)
+h_wei<-summary(best_wei,type="hazard",t=my_time)
+
+### Lnorm CuRe
+df <- my_df_ipd
+best_lnorm <- flexsurvcure(Surv(Obs_surv, Censor) ~ 1, data = df, link="logistic", bhazard = Hazard,mixture=T, dist = "lnorm")
+myLnL[2] <- best_lnorm$loglik
+myPram[2]<-best_lnorm$npars
+myAIC[2] <- best_lnorm$AIC
+S_lnorm<-summary(best_lnorm,type="survival",t=my_time)
+#plot(S_lnorm[[1]]$time,S_lnorm[[1]]$est)
+h_lnorm<-summary(best_lnorm,type="hazard",t=my_time)
+
+###
+# A problem: how to calculate the cure_p?, or "flexsurvcure" has already finished simulating with the cure_p which I cannot see
+# Answer: Yes, code: best_wei2[["res"]][1], theta is the parameter of cure rate
+###
+
+###-----------------------------------------------------###
+###           non   mixture  cure   model
+###-----------------------------------------------------###
+### weibull CuRe
+df <- my_df_ipd
+best_wei2 <- flexsurvcure(Surv(Obs_surv, Censor) ~ 1, data = df, link="loglog", bhazard = Hazard,mixture=F, dist = "weibull")
+myLnL[3] <- best_wei2$loglik
+myPram[3]<-best_wei2$npars
+myAIC[3] <- best_wei2$AIC
+S_wei2<-summary(best_wei2,type="survival",t=my_time)
+#plot(S_wei2[[1]]$time,S_wei2[[1]]$est)
+h_wei2<-summary(best_wei2,type="hazard",t=my_time)
+
+### Lnorm CuRe
+df <- my_df_ipd
+best_lnorm2 <- flexsurvcure(Surv(Obs_surv, Censor) ~ 1, data = df, link="loglog", bhazard = Hazard,mixture=F, dist = "lnorm")
+myLnL[4] <- best_lnorm2$loglik
+myPram[4]<-best_lnorm2$npars
+myAIC[4] <- best_lnorm2$AIC
+S_lnorm2<-summary(best_lnorm2,type="survival",t=my_time)
+#plot(S_lnorm2[[1]]$time,S_lnorm2[[1]]$est)
+h_lnorm2<-summary(best_lnorm2,type="hazard",t=my_time)
+
+###-----------------------------------------------------###
+###                   write results
+###-----------------------------------------------------###
+FSCmod<-c("mix_wei","mix_lnorm","nmix_wei","nmix_lnorm")
+FSCres<-cbind(FSCmod,myLnL,myPram,myAIC)
+FSCres<-as.data.frame(FSCres)
+# FSCres$FSCmod[which.min(FSCres$myAIC)]
+# best all lnorm
+
+MODi<-15
+h_lnorm_1<-summary(best_lnorm,type="hazard",t=my_time)[[1]]$est
+h_lnorm_2<-summary(best_lnorm,type="hazard",t=my_time2)[[1]]$est
+surv_fsc_mix<-summary(best_lnorm,type="survival",t=my_time2)[[1]]$est
+dfHazEst[MODi,]<-h_lnorm_2
+ltHaz[modnames[[11]]] <- h_lnorm_1
+dfGOF[MODi,1] <- modnames[[11]]
+dfGOF[MODi,2] <- best_lnorm$loglik
+dfGOF[MODi,3] <- best_lnorm$npars
+
+MODi<-16
+h_lnorm_3<-summary(best_lnorm2,type="hazard",t=my_time)[[1]]$est
+h_lnorm_4<-summary(best_lnorm2,type="hazard",t=my_time2)[[1]]$est
+surv_fsc_nmix<-summary(best_lnorm2,type="survival",t=my_time2)[[1]]$est
+dfHazEst[MODi,]<-df_mod_2$Pred
+ltHaz[modnames[[12]]] <- df_mod_1$Pred
+dfGOF[MODi,1] <- modnames[[12]]
+dfGOF[MODi,2] <- best_lnorm2$loglik
+dfGOF[MODi,3] <- best_lnorm2$npars
+
+
+```
+
+```{r AIC & export, echo=TRUE}
+dfGOF$AIC <- -2*dfGOF$LnL + 2*dfGOF$Params
+# write.csv(dfGOF,"AIC.csv")
+dfGOF
+
+```
+
+```{r Some   Plots, echo=TRUE}
+###-----------------------------------------------###
+###                 Hazard  plot
+###-----------------------------------------------###
+#  only 13 models
+dfFig <- t(na.omit(dfHazEst))
+colnames(dfFig) <- c("lnorm","llogis","gamma","FP","RCS","RP","GAM1","GAM2","Mixture Model","cuRe_mixture","cuRe_nmixture","Flex_cure_mix","Flex_cure_nmix")
+dfFig <- cbind(data.frame(Newtime$lnTime), dfFig)
+dfFig = dfFig %>% mutate(Time = exp(Newtime.lnTime)) %>% select(-Newtime.lnTime) %>%
+  gather(key = "Model", value = "Haz", -Time) %>% mutate(Model = factor(Model))
+dfFig$Model = fct_recode(dfFig$Model, "lognormal"="lnorm", "loglogistic"="llogis")
+
+###  hazard ratio   ###
+fighr <- ggplot() +
+  geom_point(data=ltHaz, aes(x=Time, y=hazLT, size=AtRisk), shape = 1) +  
+  geom_line(data=filter(dfFig, Model %in% c("lognormal")), aes(x=Time, y=Haz), color="Black") + 
+  labs(x="Time", y="Hazard")  + guides(size="none") +
+  theme(legend.position = "bottom") + coord_cartesian(ylim=c(0,0.045), xlim=c(0,4)) 
+fighr
+###-----------------------------------------------###
+###                 Survival  plot
+###-----------------------------------------------###
+dfHaz <- t(na.omit(dfHazEst))
+colnames(dfHaz) <- c("lnorm","llogis","gamma","FP","RCS","RP","GAM1","GAM2","Mixture Model","cuRe_mixture","cuRe_nmixture","Flex_cure_mix","Flex_cure_nmix")
+dfHaz <- cbind(data.frame(Newtime$lnTime), dfHaz)
+dfHaz$Time <- exp(dfHaz$Newtime.lnTime)
+#
+dfSurv<-as.data.frame(matrix(nrow = 90,ncol = 14))
+dfSurv[[1]]<-dfHaz$Time
+for ( i in 2:10 ) {
+  dftemp<-data.frame(dfHaz$Time,dfHaz[[i]])
+  dftemp<-dftemp %>% 
+    dplyr::arrange(dftemp[[1]]) %>% 
+    dplyr::mutate(cumhaz = cumsum(dftemp[[2]])) %>% 
+    dplyr::mutate(survProp = exp(-1*cumhaz))
+  dfSurv[[i]]<-dftemp[[4]]
+}
+dfSurv[[11]]<-surv_cure_mix
+dfSurv[[12]]<-surv_cure_nmix
+dfSurv[[13]]<-surv_fsc_mix
+dfSurv[[14]]<-surv_fsc_nmix
+colnames(dfSurv)<-c("Time","lnorm","llogis","gamma","FP","RCS","RP","GAM1","GAM2","Mixture Model","cuRe_mixture","cuRe_nmixture","Flex_cure_mix","Flex_cure_nmix")
+dfFigSurv = dfSurv %>%
+  gather(key = "Model", value = "survProp", -Time) %>% mutate(Model = factor(Model))
+dfSurv_48<-dfSurv[1:48,]
+dfFigSurv_48 = dfSurv_48 %>%
+  gather(key = "Model", value = "survProp", -Time) %>% mutate(Model = factor(Model))
+###------------------------------------------###
+###           process of whole gef           ###
+gef$rectime = gef$recyrs * 365
+gef$rectime2 <- as.integer(gef$rectime/(365.24/12)) + 1
+ltgef2 <- lifeTable(gef, timeColumn = "rectime2", eventColumn = "censrec")
+ltHaz2 <- data.frame(hazKM = ltgef2$Output$hazard, Time = (seq(1:length(ltgef2$Output[,1]))-0.5)/12,
+                    AtRisk = ltgef2$Output$atRisk, Events = ltgef2$Output$events)
+# The above hazard is the product-limit (KM) estimate. Also calculate the life-table (acturial) estimate
+ltHaz2$hazLT = ltHaz2$Events / (ltHaz2$AtRisk - ltHaz2$Events/2)
+# Generate log-time
+ltHaz2$lnTime <- log(ltHaz2$Time)
+# For random effects add an ID for each time period
+ltHaz2$MyId <- 1:dim(ltHaz2)[1] # Generate id variable 
+# For AR(1) model get outcomes lagged by one.
+ltHaz2$EventsL <- lag(ltHaz2$Events)
+# Set first lagged value = 0 (usually would discard, but retain so IC are comparable. Can be justified as a prior value)
+ltHaz2$EventsL[1] <- 0
+#Set surv data
+ltHaz2$surv <- ltgef2$Output$S
+###------------------------------------------###
+### plot  ###
+###    Fit    ###
+f_surv1= ggplot() +
+  geom_line(data=dfFigSurv_48, aes(x=Time, y=survProp, group=Model, colour=Model), size=1) +
+  geom_line(data=ltHaz, aes(x=Time, y=surv,colour="KM"), size=1,colour="Black")+
+  scale_color_discrete(name="Model")+
+  expand_limits(y=c(0,1),x=c(0,4)) + 
+  #facet_wrap(~Model,nrow=5)+
+  scale_x_continuous(breaks = c(seq(from=0, to=4,by = 1))) +
+  ylab("OS") +
+  xlab("Time(Years)") +
+  guides(color = guide_legend(ncol = 1))  +
+  theme(legend.position = "bottom") + 
+  theme_bw() 
+f_surv1
+
+###    extrapolation    ###
+f_surv1= ggplot() +
+  geom_line(data=dfFigSurv, aes(x=Time, y=survProp, group=Model, colour=Model), size=1) +
+  geom_line(data=ltHaz2, aes(x=Time, y=surv,colour="KM"), size=1,colour="Black")+
+  scale_color_discrete(name="Model")+
+  expand_limits(y=c(0,1),x=c(0,8)) + 
+  #facet_wrap(~Model,nrow=5)+
+  scale_x_continuous(breaks = c(seq(from=0, to=8,by = 1))) +
+  ylab("OS") +
+  xlab("Time(Years)") +
+  guides(color = guide_legend(ncol = 1))  +
+  theme(legend.position = "bottom") + 
+  theme_bw() 
+f_surv1
+
+```

@@ -1,0 +1,2367 @@
+---
+title: "new-flex-models"
+author: "Taihang Shao"
+date: '2022-07-17'
+output: html_document
+---
+
+## #Content
+
+```{r Content, echo=TRUE}
+# 1. Setup #Load R packages
+# 2. Data_source #reconstructed survival data input
+# 3. Process data #lthaz data process
+# 4. Check log_cum_haz #check for PH assumption
+# 5. Check for survival data #check the new KM of reconstructed IPD
+# 6. Process data for the models #sd_bc data process
+# 7. Check linearity #check the linearity for the hazard
+# 8. Process new data(used for extrapolate) #process newtime and newtime2
+# 9. Standard survival models 
+# 10. Fractional polynomial 
+# 11. FP  choose model # a regular process to distinguish models between FP1 and FP2
+# 12. Restricted cubic splines 
+# 13. Royston-Parmar models 
+# 14. Generalised additive models 
+# 15. Fractional polynomials with random effects 
+# 16. FP  choose model2 
+# 17. Restricted cubic splines with random effects
+# 18. Generalised additive models with random effects
+# 19. Stan: Dynamic survival models-local-level-local-damped
+# 20. Dynamic survival models-local-level-local-damped
+# 21. Stan: Dynamic survival models-global-level-local-damped
+# 22. Dynamic survival models-global-level-local-damped
+# 23. Stan: Dynamic survival models-local-level-local-trend
+# 24. Dynamic survival models-local-level-local-trend
+# 25. Stan: Dynamic survival models-global-level-local-trend
+# 26. Dynamic survival models-global-level-local-trend
+# 27. DfGOF process of Dynamic survival models
+# 28. Dynamic survival models-DGLM
+# 29. Cure models
+# 30. Goodness-of-fit
+# 31. Extrapolate for 6.5 years-surv data process
+# 32. Within sample fit for 3 years-surv data process
+# 33. Extrapolate for 40 years-surv data process
+# 34. Calculate MSE
+
+# Models with random effects may have some problems
+# Stan section better save as an independent stan file
+
+
+
+```
+
+## #Setup
+
+```{r Setup, message=FALSE, warning=FALSE}
+# Load required packages
+library("tidyverse")   # Mainly for plotting
+library("discSurv")    # Create life tables
+library("flexsurv")    # RPs (also loads survival) and BC case-study
+library("lme4")        # RE components
+library("mgcv")        # GAM
+library("KFAS")        # DSM
+library("gridExtra")   # Plotting
+library("zoo")         # Aid in time-series analyses
+library("ggplot2")     # Mainly for plotting
+library("survHE")      # Plotting
+library("survminer")   # KM curve
+library("here")        # Here
+library("rstan")       # stan file  
+library("parallel")    # More CPU cores to run the code
+library("cuRe")        # old cure model
+library("flexsurvcure")# new cure model
+theme_set(theme_light())  # GGplot theme
+```
+
+## #data_source
+
+```{r data_source, echo=TRUE}
+niv5y <- read.delim("IPD_os_niv_6.5y.txt")
+niv5y<-data.frame(niv5y$event,niv5y$time)
+niv5y<-rename(niv5y,"censrec"="niv5y.event","recyrs"="niv5y.time")
+niv5y$recyrs<-niv5y$recyrs/12
+niv5y$rectime<-as.integer(niv5y$recyrs*365.24) 
+
+niv5y = niv5y %>% mutate(censrec = case_when(niv5y$recyrs > 6.5 ~ integer(1), TRUE ~ niv5y$censrec),
+                         recyrs = case_when(niv5y$recyrs > 6.5 ~ 6.5, TRUE ~ niv5y$recyrs),
+                         rectime = recyrs * 365)
+
+niv3y <- read.delim("IPD_os_niv_3y.txt")
+niv3y<-data.frame(niv3y$event,niv3y$time)
+niv3y<-rename(niv3y,"censrec"="niv3y.event","recyrs"="niv3y.time")
+niv3y$recyrs<-niv3y$recyrs/12
+niv3y$rectime<-as.integer(niv3y$recyrs*365.24) 
+
+niv3y = niv3y %>% mutate(censrec = case_when(niv3y$recyrs > 3 ~ integer(1), TRUE ~ niv3y$censrec),
+                         recyrs = case_when(niv3y$recyrs > 3 ~ 3, TRUE ~ niv3y$recyrs),
+                         rectime = recyrs * 365)
+
+ipi5y <- read.delim("IPD_os_ipi_6.5y.txt")
+ipi5y<-data.frame(ipi5y$event,ipi5y$time)
+ipi5y<-rename(ipi5y,"censrec"="ipi5y.event","recyrs"="ipi5y.time")
+ipi5y$recyrs<-ipi5y$recyrs/12
+ipi5y$rectime<-as.integer(ipi5y$recyrs*365.24) 
+
+ipi5y = ipi5y %>% mutate(censrec = case_when(ipi5y$recyrs > 6.5 ~ integer(1), TRUE ~ ipi5y$censrec),
+                         recyrs = case_when(ipi5y$recyrs > 6.5 ~ 6.5, TRUE ~ ipi5y$recyrs),
+                         rectime = recyrs * 365)
+
+ipi3y <- read.delim("IPD_os_ipi_3y.txt")
+ipi3y<-data.frame(ipi3y$event,ipi3y$time)
+ipi3y<-rename(ipi3y,"censrec"="ipi3y.event","recyrs"="ipi3y.time")
+ipi3y$recyrs<-ipi3y$recyrs/12
+ipi3y$rectime<-as.integer(ipi3y$recyrs*365.24) 
+
+ipi3y = ipi3y %>% mutate(censrec = case_when(ipi3y$recyrs > 3 ~ integer(1), TRUE ~ ipi3y$censrec),
+                         recyrs = case_when(ipi3y$recyrs > 3 ~ 3, TRUE ~ ipi3y$recyrs),
+                         rectime = recyrs * 365)
+```
+
+## #process data
+
+```{r process data, message=FALSE, warning=FALSE, include=FALSE}
+###----------------------------------------------------------- Process NIV data ------------------------------------------------------------------------------###
+###   Process NIV data   ####
+## Learn about niv
+
+table(niv5y$censrec)
+niv5y %>%
+  summarise(Min_surv = min(recyrs, na.rm = TRUE),
+            Max_surv = max(recyrs, na.rm = TRUE),
+            Mean_surv = mean(recyrs, na.rm = TRUE),
+            SD_surv = sd(recyrs, na.rm = TRUE))
+
+table(niv3y$censrec)
+niv3y %>%
+  summarise(Min_surv = min(recyrs, na.rm = TRUE),
+            Max_surv = max(recyrs, na.rm = TRUE),
+            Mean_surv = mean(recyrs, na.rm = TRUE),
+            SD_surv = sd(recyrs, na.rm = TRUE))
+
+##-----niv data 3Y Monthly life table estimates of hazard-----###
+niv3y$rectime2 <- as.integer(niv3y$rectime/(365.24/12)) + 1
+niv5y$rectime2 <- as.integer(niv5y$rectime/(365.24/12)) + 1
+#+1 above as integer rounds down, we want to round up
+ltBC <- lifeTable(niv3y, timeColumn = "rectime2", eventColumn = "censrec")
+ltHaz0 <- data.frame(hazKM = ltBC$Output$hazard, Time = (seq(1:length(ltBC$Output[,1]))-0.5)/12,
+                    AtRisk = ltBC$Output$atRisk, Events = ltBC$Output$events)
+# The above hazard is the product-limit (KM) estimate. Also calculate the life-table (acturial) estimate
+ltHaz0$hazLT = ltHaz0$Events / (ltHaz0$AtRisk - ltHaz0$Events/2)
+# Generate log-time
+ltHaz0$lnTime <- log(ltHaz0$Time)
+# For random effects add an ID for each time period
+ltHaz0$MyId <- 1:dim(ltHaz0)[1] # Generate id variable 
+# ltHaz0$re<-scale(ltHaz0$MyId)
+# For AR(1) model get outcomes lagged by one.
+ltHaz0$EventsL <- lag(ltHaz0$Events)
+# Set first lagged value = 0 (usually would discard, but retain so IC are comparable. Can be justified as a prior value)
+ltHaz0$EventsL[1] <- 0
+#Set surv data
+ltHaz0$surv <- ltBC$Output$S
+#timedelta
+ltHaz0$timedelta<-ltHaz0$Time[2]-ltHaz0$Time[1]
+
+##-----niv data 5Y Monthly life table estimates of hazard-----### 
+ltBC_out <- lifeTable(niv5y, timeColumn = "rectime2", eventColumn = "censrec")
+ltHaz0_out <- data.frame(hazKM = ltBC_out$Output$hazard, Time = (seq(1:length(ltBC_out$Output[,1]))-0.5)/12,
+                        AtRisk = ltBC_out$Output$atRisk, Events = ltBC_out$Output$events)
+# The above hazard is the product-limit (KM) estimate. Also calculate the life-table (acturial) estimate
+ltHaz0_out$hazLT = ltHaz0_out$Events / (ltHaz0_out$AtRisk - ltHaz0_out$Events/2)
+# Generate log-time
+ltHaz0_out$lnTime <- log(ltHaz0_out$Time)
+# For random effects add an ID for each time period
+ltHaz0_out$MyId <- 1:dim(ltHaz0_out)[1] # Generate id variable 
+# ltHaz0_out$re<-scale(ltHaz0_out$MyId)
+
+# For AR(1) model get outcomes lagged by one.
+ltHaz0_out$EventsL <- lag(ltHaz0_out$Events)
+# Set first lagged value = 0 (usually would discard, but retain so IC are comparable. Can be justified as a prior value)
+ltHaz0_out$EventsL[1] <- 0
+#Set surv data
+ltHaz0_out$surv <- ltBC_out$Output$S
+#timedelta
+ltHaz0_out$timedelta<-ltHaz0_out$Time[2]-ltHaz0_out$Time[1]
+
+###------------------------------------------------------------ Process ipi data -----------------------------------------------------------------------------####
+###  Process ipi data  ####
+## Learn about ipi
+
+table(ipi5y$censrec)
+ipi5y %>%
+  summarise(Min_surv = min(recyrs, na.rm = TRUE),
+            Max_surv = max(recyrs, na.rm = TRUE),
+            Mean_surv = mean(recyrs, na.rm = TRUE),
+            SD_surv = sd(recyrs, na.rm = TRUE))
+
+table(ipi3y$censrec)
+ipi3y %>%
+  summarise(Min_surv = min(recyrs, na.rm = TRUE),
+            Max_surv = max(recyrs, na.rm = TRUE),
+            Mean_surv = mean(recyrs, na.rm = TRUE),
+            SD_surv = sd(recyrs, na.rm = TRUE))
+
+
+##-----ipi data 3Y Monthly life table estimates of hazard-----##
+ipi3y$rectime2 <- as.integer(ipi3y$rectime/(365.24/12)) + 1
+ipi5y$rectime2 <- as.integer(ipi5y$rectime/(365.24/12)) + 1
+#+1 above as integer rounds down, we want to round up
+ltBC1 <- lifeTable(ipi3y, timeColumn = "rectime2", eventColumn = "censrec")
+ltHaz1 <- data.frame(hazKM = ltBC1$Output$hazard, Time = (seq(1:length(ltBC1$Output[,1]))-0.5)/12,
+                    AtRisk = ltBC1$Output$atRisk, Events = ltBC1$Output$events)
+# The above hazard is the product-limit (KM) estimate. Also calculate the life-table (acturial) estimate
+ltHaz1$hazLT = ltHaz1$Events / (ltHaz1$AtRisk - ltHaz1$Events/2)
+# Generate log-time
+ltHaz1$lnTime <- log(ltHaz1$Time)
+# For random effects add an ID for each time period
+ltHaz1$MyId <- 1:dim(ltHaz1)[1] # Generate id variable 
+# For AR(1) model get outcomes lagged by one.
+ltHaz1$EventsL <- lag(ltHaz1$Events)
+# Set first lagged value = 0 (usually would discard, but retain so IC are comparable. Can be justified as a prior value)
+ltHaz1$EventsL[1] <- 0
+#Set surv data
+ltHaz1$surv <- ltBC1$Output$S
+#timedelta
+ltHaz1$timedelta<-ltHaz1$Time[2]-ltHaz1$Time[1]
+
+
+##-----ipi data 5Y Monthly life table estimates of hazard----- ##
+ltBC1_out <- lifeTable(ipi5y, timeColumn = "rectime2", eventColumn = "censrec")
+ltHaz1_out <- data.frame(hazKM = ltBC1_out$Output$hazard, Time = (seq(1:length(ltBC1_out$Output[,1]))-0.5)/12,
+                        AtRisk = ltBC1_out$Output$atRisk, Events = ltBC1_out$Output$events)
+# The above hazard is the product-limit (KM) estimate. Also calculate the life-table (acturial) estimate
+ltHaz1_out$hazLT = ltHaz1_out$Events / (ltHaz1_out$AtRisk - ltHaz1_out$Events/2)
+# Generate log-time
+ltHaz1_out$lnTime <- log(ltHaz1_out$Time)
+# For random effects add an ID for each time period
+ltHaz1_out$MyId <- 1:dim(ltHaz1_out)[1] # Generate id variable 
+# For AR(1) model get outcomes lagged by one.
+ltHaz1_out$EventsL <- lag(ltHaz1_out$Events)
+# Set first lagged value = 0 (usually would discard, but retain so IC are comparable. Can be justified as a prior value)
+ltHaz1_out$EventsL[1] <- 0
+#Set surv data
+ltHaz1_out$surv <- ltBC1_out$Output$S
+#timedelta
+ltHaz1_out$timedelta<-ltHaz1_out$Time[2]-ltHaz1_out$Time[1]
+```
+
+## #check log_cum_haz for this study
+
+```{r check log_cum_haz for this study, echo=TRUE}
+lch_niv_3y<-ltHaz0 %>%
+  dplyr::mutate(logTime = log(Time)) %>%
+  dplyr::mutate(cumhaz = cumsum(hazKM)) %>% 
+  dplyr::mutate(logcumhaz = log(cumhaz)) %>%
+  dplyr::mutate(survProp = exp(-1*cumhaz))
+lch_ipi_3y<-ltHaz1 %>%
+  dplyr::mutate(logTime = log(Time)) %>%
+  dplyr::mutate(cumhaz = cumsum(hazKM)) %>% 
+  dplyr::mutate(logcumhaz = log(cumhaz)) %>%
+  dplyr::mutate(survProp = exp(-1*cumhaz))
+
+f_surv1= ggplot() +
+  geom_line(data=lch_niv_3y, aes(x=logTime, y=logcumhaz), size=1) +
+  expand_limits(y=c(-4,1),x=c(-4,1)) + 
+  scale_x_continuous(breaks = c(seq(from=-4, to=1,by = 1))) +
+  ylab("logcumhaz") +
+  xlab("logTime") +
+  guides(color = guide_legend(ncol = 1))  +
+  theme(legend.position = "bottom") + 
+  theme_bw() 
+# f_surv1
+
+f_surv2= ggplot() +
+  geom_line(data=lch_ipi_3y, aes(x=logTime, y=logcumhaz), size=1) +
+  expand_limits(y=c(-4,1),x=c(-4,1)) + 
+  scale_x_continuous(breaks = c(seq(from=-4, to=1,by = 1))) +
+  ylab("logcumhaz") +
+  xlab("logTime") +
+  guides(color = guide_legend(ncol = 1))  +
+  theme(legend.position = "bottom") + 
+  theme_bw() 
+# f_surv2
+
+f_surv_c1= ggplot() +
+  geom_line(data=lch_niv_3y, aes(x=logTime, y=logcumhaz), size=1) +
+  geom_line(data=lch_ipi_3y, aes(x=logTime, y=logcumhaz), size=1) +
+  expand_limits(y=c(-4,1),x=c(-4,1)) + 
+  scale_x_continuous(breaks = c(seq(from=-4, to=1,by = 1))) +
+  ylab("logcumhaz_3y") +
+  xlab("logTime") +
+  guides(color = guide_legend(ncol = 1))  +
+  theme(legend.position = "bottom") + 
+  theme_bw() 
+f_surv_c1
+
+
+# ggplot() +geom_line(data=lch_niv_3y, aes(x=Time, y=logcumhaz), size=1) +
+#   expand_limits(y=c(-4,1),x=c(0,3)) + 
+#   scale_x_continuous(breaks = c(seq(from=0, to=3,by = 1))) +
+#   ylab("logcumhaz") +
+#   xlab("logTime") +
+#   guides(color = guide_legend(ncol = 1))  +
+#   theme(legend.position = "bottom") + 
+#   theme_bw()
+
+#5y
+lch_niv_5y<-ltHaz0_out %>%
+  dplyr::mutate(logTime = log(Time)) %>%
+  dplyr::mutate(cumhaz = cumsum(hazKM)) %>% 
+  dplyr::mutate(logcumhaz = log(cumhaz)) %>%
+  dplyr::mutate(survProp = exp(-1*cumhaz))
+lch_ipi_5y<-ltHaz1_out %>%
+  dplyr::mutate(logTime = log(Time)) %>%
+  dplyr::mutate(cumhaz = cumsum(hazKM)) %>% 
+  dplyr::mutate(logcumhaz = log(cumhaz)) %>%
+  dplyr::mutate(survProp = exp(-1*cumhaz))
+
+f_surv3= ggplot() +
+  geom_line(data=lch_niv_5y, aes(x=logTime, y=logcumhaz), size=1) +
+  expand_limits(y=c(-4,1),x=c(-4,1)) + 
+  scale_x_continuous(breaks = c(seq(from=-4, to=1,by = 1))) +
+  ylab("logcumhaz") +
+  xlab("logTime") +
+  guides(color = guide_legend(ncol = 1))  +
+  theme(legend.position = "bottom") + 
+  theme_bw() 
+# f_surv3
+
+f_surv4= ggplot() +
+  geom_line(data=lch_ipi_5y, aes(x=logTime, y=logcumhaz), size=1) +
+  expand_limits(y=c(-4,1),x=c(-4,1)) + 
+  scale_x_continuous(breaks = c(seq(from=-4, to=1,by = 1))) +
+  ylab("logcumhaz") +
+  xlab("logTime") +
+  guides(color = guide_legend(ncol = 1))  +
+  theme(legend.position = "bottom") + 
+  theme_bw() 
+# f_surv4
+
+f_surv_c2= ggplot() +
+  geom_line(data=lch_niv_5y, aes(x=logTime, y=logcumhaz), size=1) +
+  geom_line(data=lch_ipi_5y, aes(x=logTime, y=logcumhaz), size=1) +
+  expand_limits(y=c(-4,1),x=c(-4,1)) + 
+  scale_x_continuous(breaks = c(seq(from=-4, to=1,by = 1))) +
+  ylab("logcumhaz_5y") +
+  xlab("logTime") +
+  guides(color = guide_legend(ncol = 1))  +
+  theme(legend.position = "bottom") + 
+  theme_bw() 
+f_surv_c2
+
+```
+
+## #check for survival data
+
+```{r check for survival data, eval=FALSE, include=FALSE}
+fit_niv3y<-survfit(Surv(niv3y$recyrs,niv3y$censrec)~1,data=niv3y)
+ggsurvplot(fit_niv3y,data=niv3y)
+fit_niv5y<-survfit(Surv(niv5y$recyrs,niv5y$censrec)~1,data=niv5y)
+ggsurvplot(fit_niv5y,data=niv5y)
+fit_ipi3y<-survfit(Surv(ipi3y$recyrs,ipi3y$censrec)~1,data=ipi3y)
+ggsurvplot(fit_ipi3y,data=ipi3y)
+fit_ipi5y<-survfit(Surv(ipi5y$recyrs,ipi5y$censrec)~1,data=ipi5y)
+ggsurvplot(fit_ipi5y,data=ipi5y)
+
+```
+
+## #process data for the models
+
+```{r process data for the models,echo=TRUE}
+##data for sd
+## niv ##
+ltHaz<-ltHaz0
+ltHaz_out<-ltHaz0_out
+sd_bc<-data.frame("recyrs"=niv3y$recyrs,"censrec"=niv3y$censrec)
+sd_bc_out<-data.frame("recyrs"=niv5y$recyrs,"censrec"=niv5y$censrec)
+## ipi ##
+# ltHaz<-ltHaz1
+# ltHaz_out<-ltHaz1_out
+# sd_bc<-data.frame("recyrs"=ipi3y$recyrs,"censrec"=ipi3y$censrec)
+# sd_bc_out<-data.frame("recyrs"=ipi5y$recyrs,"censrec"=ipi5y$censrec)
+
+```
+
+## #check linearity
+
+```{r check linearity,echo=TRUE}
+#check linearity
+# Figures to check linearity (a) Log-hazard vs Time, (b) Log-hazard vs log(time)
+# Part (a, b) - get estimates of hazard from Weibull and Gompertz
+glmTemp <- flexsurvreg(Surv(recyrs, censrec) ~ 1, data = sd_bc, dist = "weibull")
+tmp_hz <- summary(glmTemp, t=ltHaz$Time, type="hazard")[[1]]$est
+glmTemp <- flexsurvreg(Surv(recyrs, censrec) ~ 1, data = sd_bc, dist = "gompertz")
+tmp_hz <- data.frame(Weibull=tmp_hz, Gompertz=summary(glmTemp, t=ltHaz$Time, type="hazard")[[1]]$est)
+tmp_hz <- log(tmp_hz/12)
+df_fig_hz <- data.frame(Time=ltHaz$Time, LogTime=log(ltHaz$Time), Loghazard=log(ltHaz$hazLT+0.001), Sample=ltHaz$AtRisk, tmp_hz)
+fig_a <- ggplot(data=df_fig_hz, aes(x=Time, y=Loghazard)) + geom_point(shape = 1, color="grey40") +
+  geom_line(aes(y=Gompertz), color="red") + guides(size="none") +
+  labs(y="Log(hazard)") + ggtitle("Gompertz") + coord_cartesian(ylim=c(-7,-2))
+fig_a
+fig_b <- ggplot(data=df_fig_hz, aes(x=LogTime, y=Loghazard)) + geom_point(shape = 1, color="grey40") +
+  geom_line(aes(y=Weibull), color="purple") + guides(size="none") +
+  labs(y="Log(hazard)", x="Log(time)") + ggtitle("Weibull") + coord_cartesian(ylim=c(-7,-2))
+fig_b
+
+```
+
+## #process new data(used for extrapolate)
+
+```{r process new data(used for extrapolate),echo=TRUE}
+####----New Data----###
+follow_up <- 36 #origin study
+numMod <- 27 # Models considered
+MyTH <- 6.5 # Time Horizon (years) (origin mature study)
+MyStep <- 12 # Number of obs. per year
+MyN <- MyTH*MyStep # Total time points (observed & extrapolated)
+dfHazEst <- array(dim=c(numMod, MyN))
+Newtime <- data.frame(Time = ltHaz_out$Time, AtRisk = 1)
+Newtime$MyId <- 1:dim(Newtime)[1]
+Newtime$MyId <- ifelse(Newtime$MyId > follow_up, follow_up, Newtime$MyId)  # Random effects: Using last observed ID for extrapolation
+# Newtime$re<-scale(Newtime$MyId)
+Newtime$EventsL <- 0
+Newtime$EventsL[1:follow_up] <- lag(ltHaz$Events)
+Newtime$EventsL[1] <- 0
+Newtime$EventsL <- ifelse(Newtime$MyId > follow_up, 0, Newtime$EventsL) # AR: Using last observed event count for extrapolation
+Newtime$timedelta<-Newtime$Time[2]-Newtime$Time[1]
+Newtime$lnTime<-log(Newtime$Time)
+
+
+MyTH2 <- 40 # Time Horizon (years)
+MyStep2 <- 12 # Number of obs. per year
+MyN2 <- MyTH2*MyStep2 # Total time points (observed & extrapolated)
+dfHazEst2 <- array(dim=c(numMod, MyN2))
+dfHazEst3 <- array(dim=c(numMod, MyN2))
+Newtime2 <- data.frame(Time = seq(from=1/MyStep2, to=MyTH2, by=1/MyStep2), AtRisk = 1)
+Newtime2$MyId <- 1:dim(Newtime2)[1]
+Newtime2$MyId <- ifelse(Newtime2$MyId > follow_up, follow_up, Newtime2$MyId)  # Random effects: Using last observed ID for extrapolation
+# Newtime2$re<-scale(Newtime2$MyId)
+Newtime2$EventsL <- 0
+Newtime2$EventsL[1:follow_up] <- lag(ltHaz$Events)
+Newtime2$EventsL[1] <- 0
+Newtime2$EventsL <- ifelse(Newtime2$MyId > follow_up, 0, Newtime2$EventsL) # AR: Using last observed event count for extrapolation
+Newtime2$timedelta<-Newtime2$Time[2]-Newtime2$Time[1]
+Newtime2$lnTime<-log(Newtime2$Time)
+# Also have 1x GOF matrix. Rows = Methods, Columns = Method, LL, AIC
+dfGOF <- data.frame(matrix(, nrow=27, ncol=5))
+dfGOF_out <- data.frame(matrix(, nrow=27, ncol=5))
+colnames(dfGOF) <- c("Model","LnL","Params","AIC","Additional inform")
+colnames(dfGOF_out) <- c("Model","LnL","Params","AIC","Additional inform")
+# Below is constant for when have to derive log-likelihood
+llCons <- sum(ltHaz$Events*log(ltHaz$AtRisk) - log(factorial(ltHaz$Events)))
+llCons_out<-sum(ltHaz_out$Events*log(ltHaz_out$AtRisk) - log(factorial(ltHaz_out$Events)))
+# Names of models to consider
+md<-c("exp","weibull","gamma","lnorm","gompertz","llogis","gengamma","FP1","FP2","RCS","RP-hazard","RP-odds","RP-normal","GAM","FP1-re","FP2-re","RCS-re","GAM-re","DSM-llld","DSM-glld","DSM-lllt","DSM-gllt","DSM-DGLM-LL","DSM-DGLM-LLLT","DSM-DGLM-LLGT","mix-cure","non-mix-cure")
+
+```
+
+## #Standard survival models
+
+```{r Standard survival models,echo=TRUE}
+MODi <- 1 # Model index
+MyDists <- list("exp","weibull","gamma","lnorm","gompertz","llogis","gengamma")
+for (i in 1:7){
+  glmTemp <- flexsurvreg(Surv(recyrs, censrec) ~ 1, data = sd_bc, dist = MyDists[[i]])
+  dfHazEst[MODi,] <- summary(glmTemp, t=Newtime$Time, type="hazard")[[1]]$est/12
+  dfHazEst2[MODi,] <- summary(glmTemp, t=Newtime2$Time, type="hazard")[[1]]$est/12
+  ltHaz[[MyDists[[i]]]] <- summary(glmTemp, t=ltHaz$Time, type="hazard")[[1]]$est/12
+  dfGOF[MODi,1] <- MyDists[[i]]
+  dfGOF[MODi,2] <- sum(ltHaz$Events*log(ltHaz[[MyDists[[i]]]]) - ltHaz[[MyDists[[i]]]]*ltHaz$AtRisk) + llCons
+  dfGOF[MODi,3] <- glmTemp$npars
+  coeff_temp<-as.data.frame(glmTemp$coefficients)
+  t1<-"Param"
+  for (i in 1:length(glmTemp$coefficients)) {
+    t0<-paste(rownames(coeff_temp)[i],round(coeff_temp[i,1],2),sep = "=")
+    t1<-paste(t1,t0,sep = ";")
+  }
+  dfGOF[MODi,5] <- t1
+  MODi<-MODi+1
+}
+
+```
+
+## #Fractional polynomial
+
+```{r Fractional polynomial, echo=TRUE, warning=FALSE}
+#-----FP1 -----
+myLnL <- array(dim=8)
+myAIC <- array(dim=8)
+MyPowers <- list(c(-2,-1,-0.5,0.5,1,2,3))
+for (i in 1:7){
+  glmTemp <- glm (cbind(Events,AtRisk-Events) ~ I(Time^MyPowers[[1]][i]) + offset(log(timedelta)), family=binomial(link=cloglog), data=ltHaz)
+  myLnL[i] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+  myAIC[i] <- extractAIC(glmTemp)[2]
+}
+### run for 0
+glmTemp <- glm (cbind(Events,AtRisk-Events) ~ I(Time^0*lnTime) + offset(log(timedelta)), family=binomial(link=cloglog), data=ltHaz)
+myLnL[8] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+myAIC[8] <- extractAIC(glmTemp)[2]
+
+FP1res <- data.frame(c("-2","-1","-0.5","0","0.5","1","2","3"))
+FP1res <- cbind(FP1res,myLnL,myAIC)
+colnames(FP1res) <- c("Powers","LnL","AIC")
+FP1res <-arrange(FP1res,AIC)
+FP1_pow <- as.numeric(FP1res[1,1])
+
+#-----FP2 -----
+myLnL <- array(dim=36)
+myAIC <- array(dim=36)
+MyPowers <- list(c(-2,-1,-0.5,0.5,1,2,3))
+index <- 1
+for (i in 1:7){
+  for (j in 1:7){
+    if (j > i) {
+      glmTemp <- glm(cbind(Events,AtRisk-Events) ~ I(Time^MyPowers[[1]][i]) + I(Time^MyPowers[[1]][j])+ offset(log(timedelta)), family=binomial(link=cloglog), data=ltHaz)# 
+      myLnL[index] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+      myAIC[index] <- extractAIC(glmTemp)[2]
+      index <- index + 1
+    }
+  }
+}
+for (i in 1:7) {
+  glmTemp <- glm(cbind(Events,AtRisk-Events) ~ I(Time^MyPowers[[1]][i]) + I(Time^MyPowers[[1]][i]*lnTime)+ offset(log(timedelta)), family=binomial(link=cloglog), data=ltHaz)# 
+  myLnL[index] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+  myAIC[index] <- extractAIC(glmTemp)[2]
+  index <- index + 1
+}
+
+for (i in 1:7) {
+  glmTemp <- glm(cbind(Events,AtRisk-Events) ~ I(Time^MyPowers[[1]][i]) + I(Time^0*lnTime)+ offset(log(timedelta)), family=binomial(link=cloglog), data=ltHaz)# 
+  myLnL[index] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+  myAIC[index] <- extractAIC(glmTemp)[2]
+  index <- index + 1
+}
+
+glmTemp <- glm(cbind(Events,AtRisk-Events) ~ I(Time^0*lnTime) + I(Time^0*lnTime*lnTime)+ offset(log(timedelta)), family=binomial(link=cloglog), data=ltHaz)# 
+myLnL[index] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+myAIC[index] <- extractAIC(glmTemp)[2]
+
+FP2res <- data.frame(c("-2,-1","-2,-0.5","-2.0.5","-2,1","-2,2","-2,3","-1,-0.5","-1,0.5","-1,1","-1,2","-1,3","-0.5,0.5","-0.5,1","-0.5,2","-0.5,3",
+                       "0.5,1","0.5,2","0.5,3","1,2","1,3","2,3","-2,-2","-1,-1","-0.5,-0.5","0.5,0.5","1,1","2,2","3,3",
+                       "-2,0","-1,0","-0.5,0","0.5,0","1,0","2,0","3,0","0,0"))
+FP2res <- cbind(FP2res,myLnL,myAIC)
+colnames(FP2res) <- c("Powers","LnL","AIC")
+FP2res <-arrange(FP2res,AIC)
+FP2_pow_temp <- FP2res[1,1]
+t0<-as.data.frame(strsplit(FP2_pow_temp,","))
+FP2_pow_1<-as.numeric(t0[1,1])
+FP2_pow_2<-as.numeric(t0[2,1])
+
+##summary results
+if(FP1_pow==0){
+  modFP1 <- glm (cbind(Events,AtRisk-Events) ~ I(Time^0*lnTime) + offset(log(timedelta)), family=binomial(link=cloglog), data=ltHaz)
+}else{modFP1 <- glm(cbind(Events,AtRisk-Events) ~ I(Time^FP1_pow)+ offset(log(timedelta)) , family=binomial(link=cloglog), data=ltHaz)}
+
+
+if(FP2_pow_1 == FP2_pow_2 & FP2_pow_2 != 0){
+  modFP2<-glm(cbind(Events,AtRisk-Events) ~ I(Time^FP2_pow_1) + I(Time^FP2_pow_2*lnTime) + offset(log(timedelta)), family=binomial(link=cloglog), data=ltHaz)
+}else if(FP2_pow_1==0 & FP2_pow_2==0){
+  modFP2<-glm(cbind(Events,AtRisk-Events) ~ I(Time^0*lnTime) + I(Time^0*lnTime*lnTime)+ offset(log(timedelta)), family=binomial(link=cloglog), data=ltHaz) 
+}else if(FP2_pow_2==0 & FP2_pow_1 != 0){
+  modFP2<-glm(cbind(Events,AtRisk-Events) ~ I(Time^MyPowers[[1]][i]) + I(Time^0*lnTime)+ offset(log(timedelta)), family=binomial(link=cloglog), data=ltHaz)
+}else{
+  modFP2<-glm(cbind(Events,AtRisk-Events) ~ I(Time^FP2_pow_1) + I(Time^FP2_pow_2) + offset(log(timedelta)), family=binomial(link=cloglog), data=ltHaz)
+}
+
+
+MODi <- 8
+dfGOF[MODi,1] <- md[MODi]
+dfGOF[MODi,2] <- (extractAIC(modFP1)[2] - 2*extractAIC(modFP1)[1])*(-0.5)
+dfGOF[MODi,3] <- extractAIC(modFP1)[1]
+dfGOF[MODi,5] <- paste("Param",FP1_pow,sep=";")
+
+# Hazard estimates
+dfHazEst[MODi,] <- predict(modFP1, newdata=Newtime, type="response") # Extrapolated
+dfHazEst2[MODi,] <- predict(modFP1, newdata=Newtime2, type="response") # Extrapolated
+ltHaz[md[MODi]] <- predict(modFP1, newdata=ltHaz, type="response")  # Within-sample
+
+
+MODi<-9
+dfGOF[MODi,1] <- md[MODi]
+dfGOF[MODi,2] <- (extractAIC(modFP2)[2] - 2*extractAIC(modFP2)[1])*(-0.5)
+dfGOF[MODi,3] <- extractAIC(modFP2)[1]
+dfGOF[MODi,5] <- paste("Param",FP2_pow_temp,sep=";")
+
+# Hazard estimates
+dfHazEst[MODi,] <- predict(modFP2, newdata=Newtime, type="response") # Extrapolated
+dfHazEst2[MODi,] <- predict(modFP2, newdata=Newtime2, type="response") # Extrapolated
+ltHaz[md[MODi]] <- predict(modFP2, newdata=ltHaz, type="response")  # Within-sample
+
+
+```
+
+## #FP choose model
+
+```{r FP  choose model, echo=TRUE, warning=FALSE}
+# Now for the closed-test procedure for function selection
+# Note currently identifying best models manually
+# modify power
+modFP2 <- modFP2
+modFP1 <- modFP1
+modLin <- glm(cbind(Events,AtRisk-Events) ~ I(Time)+ offset(log(timedelta)) , family=binomial(link=cloglog), data=ltHaz)
+modNULL <- glm(cbind(Events,AtRisk-Events) ~ 1 + offset(log(timedelta)) , family=binomial(link=cloglog), data=ltHaz)
+# Overall association of the outcome with time (Sig result = include time)
+test_time<-anova(modNULL, modFP2, test="LRT") # p-value 8.439e-07
+p_value1<-test_time$`Pr(>Chi)`[2]
+print(paste("p=",p_value1))
+if(p_value1 < 0.05) print("Outcome is associated with time") else print("Outcome is not associated with time!")
+
+# Evidence for non-linearity (Sig result = non-linear model)
+test_linear<-anova(modLin, modFP2, test="LRT") # p-value 0.05234
+p_value2<-test_linear$`Pr(>Chi)`[2]
+print(paste("p=",p_value2))
+if(p_value2 < 0.05) print("Non-linearity model is OK") else print("There is no evidence for non-linearity model!")
+
+# Simpler or more complex non-linear model?  (Sig result = FP2, else FP1)
+test_simple<-anova(modFP1, modFP2, test="LRT") # p-value 0.05234
+p_value3<-test_simple$`Pr(>Chi)`[2]
+print(paste("p=",p_value3))
+if(p_value3 < 0.05) print("Better choose complex non-linear model--FP2") else print("Better choose simple non-linear model--FP1!")
+
+```
+
+## #Restricted cubic splines
+
+```{r Restricted cubic splines, echo=TRUE, warning=FALSE}
+MODi <- 10
+# First need knot locations for up to 5 internal knots.
+# Basing these on equally-spaced percentiles of the observed (uncensored) death times.
+bc2 <- subset(niv3y, censrec==1)
+myLnL <- array(dim=5)
+myAIC <- array(dim=5)
+for (i in 1:5){
+  glmTemp <- gam(cbind(Events,AtRisk-Events) ~ s(Time, bs="cr", k=i+2, fx=TRUE) + offset(log(timedelta)), knots=list(Time=quantile(bc2$recyrs, seq(from=0, to=1, by=1/(1+i))), length=i+2), family=binomial(link=cloglog), data=ltHaz)
+  myLnL[i] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+  myAIC[i] <- extractAIC(glmTemp)[2]
+}
+RCSres <- data.frame(c("1","2","3","4","5"))
+RCSres <- cbind(RCSres,myLnL,myAIC)
+colnames(RCSres) <- c("Int.Knots","LnL","AIC")
+RCSres<-arrange(RCSres,AIC)
+RCS_k<-as.numeric(RCSres[1,1])
+i<-RCS_k
+glmTemp1 <- gam(cbind(Events,AtRisk-Events) ~ s(Time, bs="cr", k=i+2, fx=TRUE) + offset(log(timedelta)), knots=list(Time=quantile(bc2$recyrs, seq(from=0, to=1, by=1/(1+i))), length=i+2),family=binomial(link=cloglog), data=ltHaz)
+
+dfGOF[MODi,1] <- md[MODi]
+dfGOF[MODi,2] <- (extractAIC(glmTemp1)[2] - 2*extractAIC(glmTemp1)[1])*(-0.5)
+dfGOF[MODi,3] <- extractAIC(glmTemp1)[1]
+
+coeff_temp<-as.data.frame(glmTemp1$coefficients)
+  t1<-"Param"
+  for (i in 1:length(coeff_temp[,1])) {
+    t0<-paste(rownames(coeff_temp)[i],round(coeff_temp[i,1],2),sep = "=")
+    t1<-paste(t1,t0,sep = ";")
+  }
+dfGOF[MODi,5] <- paste(t1,paste("k=",RCS_k),sep = ";")
+# Hazard estimates
+dfHazEst[MODi,] <- predict(glmTemp1, newdata=Newtime, type="response")
+dfHazEst2[MODi,] <- predict(glmTemp1, newdata=Newtime2, type="response")
+ltHaz[md[MODi]] <- predict(glmTemp1, newdata=ltHaz, type="response")
+
+```
+
+## #Royston-Parmar models
+
+```{r Royston-Parmar models, echo=TRUE}
+MODi <- 11
+MyAIC <- array(dim=c(6,3))
+MyScale <- list("hazard","odds","normal")
+for (i in 1:3){
+  for (j in 0:5){
+    fit<-try(MyTemp <- flexsurvspline(Surv(recyrs, censrec) ~ 1, data = sd_bc_out, k = j, scale = MyScale[[i]]))
+    if("try-error" %in% class(fit)) {
+      MyAIC[[(i-1)*6+1+j]] <- "error"
+    }
+    else{
+      flexsurvspline(Surv(recyrs, censrec) ~ 1, data = sd_bc_out, k = j, scale = MyScale[[i]])
+      MyAIC[[(i-1)*6+1+j]] <- (-2*MyTemp$loglik+2*MyTemp$npars)
+    }
+  }
+}
+MyAICResults <- as.data.frame(cbind(seq(1:6)-1,MyAIC))
+colnames(MyAICResults) <- c("Int.Knots","Hazard","Odds","Normal")
+best_rp_hazard<-data.frame(MyAICResults$Int.Knots,MyAICResults$Hazard)
+colnames(best_rp_hazard)<-c("knots","AIC")
+best_rp_odds<-data.frame(MyAICResults$Int.Knots,MyAICResults$Odds)
+colnames(best_rp_odds)<-c("knots","AIC")
+best_rp_normal<-data.frame(MyAICResults$Int.Knots,MyAICResults$Normal)
+colnames(best_rp_normal)<-c("knots","AIC")
+best_rp_hazard<-arrange(best_rp_hazard,AIC)
+best_rp_odds<-arrange(best_rp_odds,AIC)
+best_rp_normal<-arrange(best_rp_normal,AIC)
+
+rp_input<-as.data.frame(array(dim=c(3,2)))
+rp_input$V1<- c("hazard","odds","normal")
+rp_input$V2<-c(best_rp_hazard[1,1],
+best_rp_odds[1,1],
+best_rp_normal[1,1])
+colnames(rp_input)<-c("scale","knots")
+rp_input$knots<-as.numeric(rp_input$knots)
+
+for (i in 1:3) {
+  rp_scale<-rp_input[i,1]
+  rp_k<-rp_input[i,2]
+  rpTemp <- flexsurvspline(Surv(recyrs, censrec) ~ 1, data = sd_bc, k = rp_k, scale = rp_scale)
+  rpAIC <- (-2*rpTemp$loglik+2*rpTemp$npars)
+  dfHazEst[MODi,] <- summary(rpTemp, t=Newtime$Time, type="hazard")[[1]]$est/12
+  dfHazEst2[MODi,] <- summary(rpTemp, t=Newtime2$Time, type="hazard")[[1]]$est/12
+  ltHaz[md[MODi]] <- summary(rpTemp, t=ltHaz$Time, type="hazard")[[1]]$est/12
+  
+  dfGOF[MODi,1] <- md[MODi]
+  dfGOF[MODi,2] <- sum(ltHaz$Events*log(ltHaz[md[MODi]]) - ltHaz[[md[MODi]]]*ltHaz$AtRisk) + llCons
+  dfGOF[MODi,3] <- rpTemp$npars  
+  
+  coeff_temp<-as.data.frame(rpTemp$coefficients)
+  t1<-"Param"
+  for (i in 1:length(coeff_temp[,1])) {
+    t0<-paste(rownames(coeff_temp)[i],round(coeff_temp[i,1],2),sep = "=")
+    t1<-paste(t1,t0,sep = ";")
+  }
+  dfGOF[MODi,5] <- paste(t1,paste("knot=",rp_k),paste("scale=",rp_scale),sep = ";")
+  MODi<-MODi+1
+}  
+
+```
+
+## #Generalised additive models
+
+```{r Generalised additive models, echo=TRUE, warning=FALSE}
+#explanation of GAM vs RCS
+#both use function "gam"
+#fx is used to indicate whether or not this term should be unpenalized, and therefore have a fixed number of degrees of freedom set by k (almost always k-1)
+#bs indicates the basis to use for the smooth
+#bs="cr". These have a cubic spline basis defined by a modest sized set of knots spread evenly through the covariate values. They are penalized by the conventional intergrated square second derivative cubic spline penalty.
+
+MODi <- 14
+# Now base knots on minimising AIC
+myLnL <- array(dim=10)
+myAIC <- array(dim=10)
+for (i in 1:10){
+  glmTemp <- gam(cbind(Events,AtRisk-Events) ~ s(Time, bs="cr", k=i+2, fx=FALSE) + offset(log(timedelta)), knots=list(Time=quantile(bc2$recyrs, seq(from=0, to=1, by=1/(1+i))), length=i+2), family=binomial(link=cloglog), data=ltHaz)
+  myLnL[i] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+  myAIC[i] <- extractAIC(glmTemp)[2]
+}
+GAMres <- data.frame(c("1","2","3","4","5"))
+GAMres <- cbind(GAMres,myLnL,myAIC)
+colnames(GAMres) <- c("Int.Knots","LnL","AIC")
+GAMres<-arrange(GAMres,AIC)
+GAM_k<-as.numeric(GAMres[1,1])
+i<-GAM_k
+glmTemp1 <- gam(cbind(Events,AtRisk-Events) ~ s(Time, bs="cr", k=i+2, fx=FALSE) + offset(log(timedelta)), knots=list(Time=quantile(bc2$recyrs, seq(from=0, to=1, by=1/(1+i))), length=i+2),family=binomial(link=cloglog), data=ltHaz)
+
+dfGOF[MODi,1] <- md[MODi]
+dfGOF[MODi,2] <- (extractAIC(glmTemp1)[2] - 2*extractAIC(glmTemp1)[1])*(-0.5)
+dfGOF[MODi,3] <- extractAIC(glmTemp1)[1]
+coeff_temp<-as.data.frame(glmTemp1$coefficients)
+  t1<-"Param"
+  for (i in 1:length(coeff_temp[,1])) {
+    t0<-paste(rownames(coeff_temp)[i],round(coeff_temp[i,1],2),sep = "=")
+    t1<-paste(t1,t0,sep = ";")
+  }
+smooth_parm<-as.data.frame(glmTemp1$sp)
+  t2<-"Smooth_Param"
+  for (i in 1:length(smooth_parm[,1])) {
+    t0<-paste(rownames(smooth_parm)[i],round(smooth_parm[i,1],2),sep = "=")
+    t2<-paste(t2,t0,sep = ";")
+  }
+dfGOF[MODi,5] <- paste(paste(t1,paste("k=",GAM_k),sep = ";"),t2,sep = ";")
+# Hazard estimates
+dfHazEst[MODi,] <- predict(glmTemp1, newdata=Newtime, type="response")
+dfHazEst2[MODi,] <- predict(glmTemp1, newdata=Newtime2, type="response")
+ltHaz[md[MODi]] <- predict(glmTemp1, newdata=ltHaz, type="response")
+
+
+```
+
+## #Fractional polynomials with random effects
+
+```{r Fractional polynomials with random effects, echo=TRUE, warning=FALSE}
+# no more suitable for binomial(link=cloglog)
+#Error in (function (fr, X, reTrms, family, nAGQ = 1L, verbose = 0L, maxit = 100L,  : 
+# (maxstephalfit) PIRLS step-halvings failed to reduce deviance in pwrssUpdate
+
+#-----FP1 -----
+myLnL <- array(dim=8)
+myAIC <- array(dim=8)
+MyPowers <- list(c(-2,-1,-0.5,0.5,1,2,3))
+for (i in 1:7){
+  glmTemp <- glmer (Events ~ I(Time^MyPowers[[1]][i]) + (1|MyId) + offset(log(AtRisk)), family=poisson, data=ltHaz)
+  myLnL[i] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+  myAIC[i] <- extractAIC(glmTemp)[2]
+}
+### run for 0
+glmTemp <- glmer (Events ~ I(Time^0*lnTime) + (1|MyId) + offset(log(AtRisk)), family=poisson, data=ltHaz)
+myLnL[8] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+myAIC[8] <- extractAIC(glmTemp)[2]
+
+FP1res <- data.frame(c("-2","-1","-0.5","0","0.5","1","2","3"))
+FP1res <- cbind(FP1res,myLnL,myAIC)
+colnames(FP1res) <- c("Powers","LnL","AIC")
+FP1res <-arrange(FP1res,AIC)
+FP1_pow <- as.numeric(FP1res[1,1])
+
+#-----FP2 -----
+myLnL <- array(dim=36)
+myAIC <- array(dim=36)
+MyPowers <- list(c(-2,-1,-0.5,0.5,1,2,3))
+index <- 1
+for (i in 1:7){
+  for (j in 1:7){
+    if (j > i) {
+      glmTemp <- glmer(Events ~ I(Time^MyPowers[[1]][i]) + I(Time^MyPowers[[1]][j])+ (1|MyId) +offset(log(AtRisk)),family=poisson, data=ltHaz)# 
+      myLnL[index] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+      myAIC[index] <- extractAIC(glmTemp)[2]
+      index <- index + 1
+    }
+  }
+}
+for (i in 1:7) {
+  glmTemp <- glmer(Events ~ I(Time^MyPowers[[1]][i]) + I(Time^MyPowers[[1]][i]*lnTime)+ (1|MyId) + offset(log(AtRisk)), family=poisson, data=ltHaz)# 
+  myLnL[index] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+  myAIC[index] <- extractAIC(glmTemp)[2]
+  index <- index + 1
+}
+
+for (i in 1:7) {
+  glmTemp <- glmer(Events ~ I(Time^MyPowers[[1]][i]) + I(Time^0*lnTime)+ (1|MyId) + offset(log(AtRisk)), family=poisson, data=ltHaz)# 
+  myLnL[index] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+  myAIC[index] <- extractAIC(glmTemp)[2]
+  index <- index + 1
+}
+
+glmTemp <- glmer(Events ~ I(Time^0*lnTime) + I(Time^0*lnTime*lnTime)+ (1|MyId) + offset(log(AtRisk)), family=poisson, data=ltHaz)# 
+myLnL[index] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+myAIC[index] <- extractAIC(glmTemp)[2]
+
+FP2res <- data.frame(c("-2,-1","-2,-0.5","-2.0.5","-2,1","-2,2","-2,3","-1,-0.5","-1,0.5","-1,1","-1,2","-1,3","-0.5,0.5","-0.5,1","-0.5,2","-0.5,3",
+                       "0.5,1","0.5,2","0.5,3","1,2","1,3","2,3","-2,-2","-1,-1","-0.5,-0.5","0.5,0.5","1,1","2,2","3,3",
+                       "-2,0","-1,0","-0.5,0","0.5,0","1,0","2,0","3,0","0,0"))
+FP2res <- cbind(FP2res,myLnL,myAIC)
+colnames(FP2res) <- c("Powers","LnL","AIC")
+FP2res <-arrange(FP2res,AIC)
+FP2_pow_temp <- FP2res[1,1]
+t0<-as.data.frame(strsplit(FP2_pow_temp,","))
+FP2_pow_1<-as.numeric(t0[1,1])
+FP2_pow_2<-as.numeric(t0[2,1])
+
+##summary results
+if(FP1_pow==0){
+  modFP1_re <- glmer(Events ~ I(Time^0*lnTime) + (1|MyId) + offset(log(AtRisk)), family=poisson, data=ltHaz)
+}else{modFP1_re <- glmer(Events ~ I(Time^FP1_pow)+ (1|MyId) + offset(log(AtRisk)) , family=poisson, data=ltHaz)}
+
+
+if(FP2_pow_1 == FP2_pow_2 & FP2_pow_2 != 0){
+  modFP2_re<-glmer(Events ~ I(Time^FP2_pow_1) + I(Time^FP2_pow_2*lnTime) + (1|MyId) + offset(log(AtRisk)), family=poisson, data=ltHaz)
+}else if(FP2_pow_1==0 & FP2_pow_2==0){
+  modFP2_re<-glmer(Events ~ I(Time^0*lnTime) + I(Time^0*lnTime*lnTime)+ (1|MyId) + offset(log(AtRisk)), family=poisson, data=ltHaz) 
+}else if(FP2_pow_2==0 & FP2_pow_1 != 0){
+  modFP2_re<-glmer(Events ~ I(Time^MyPowers[[1]][i]) + I(Time^0*lnTime)+ (1|MyId) + offset(log(AtRisk)), family=poisson, data=ltHaz)
+}else{
+  modFP2_re<-glmer(Events ~ I(Time^FP2_pow_1) + I(Time^FP2_pow_2) + (1|MyId) + offset(log(AtRisk)), family=poisson, data=ltHaz)
+}
+
+
+MODi <- 15
+dfGOF[MODi,1] <- md[MODi]
+dfGOF[MODi,2] <- (extractAIC(modFP1_re)[2] - 2*extractAIC(modFP1_re)[1])*(-0.5)
+dfGOF[MODi,3] <- extractAIC(modFP1_re)[1]
+dfGOF[MODi,5] <- paste("Param",FP1_pow,sep=";")
+
+# Hazard estimates
+dfHazEst[MODi,] <- predict(modFP1_re, newdata=Newtime, type="response") # Extrapolated
+dfHazEst2[MODi,] <- predict(modFP1_re, newdata=Newtime2, type="response") # Extrapolated
+ltHaz[md[MODi]] <- predict(modFP1_re, newdata=ltHaz, type="response")  # Within-sample
+
+
+MODi<-16
+dfGOF[MODi,1] <- md[MODi]
+dfGOF[MODi,2] <- (extractAIC(modFP2_re)[2] - 2*extractAIC(modFP2_re)[1])*(-0.5)
+dfGOF[MODi,3] <- extractAIC(modFP2_re)[1]
+dfGOF[MODi,5] <- paste("Param",FP2_pow_temp,sep=";")
+
+# Hazard estimates
+dfHazEst[MODi,] <- predict(modFP2_re, newdata=Newtime, type="response") # Extrapolated
+dfHazEst2[MODi,] <- predict(modFP2_re, newdata=Newtime2, type="response") # Extrapolated
+ltHaz[md[MODi]] <- predict(modFP2_re, newdata=ltHaz, type="response")  # Within-sample
+
+```
+
+## #FP choose model2
+
+```{r FP  choose model2, echo=TRUE}
+# Now for the closed-test procedure for function selection
+# Note currently identifying best models manually
+# modify power
+modFP2_re <- modFP2_re
+modFP1_re <- modFP1_re
+modLin_re <- glmer(Events ~ I(Time) + (1|MyId)+ offset(log(timedelta)) , family=poisson, data=ltHaz)
+modNULL_re <- glmer(Events ~ 1  + (1|MyId)+ offset(log(timedelta)) , family=poisson, data=ltHaz)
+# Overall association of the outcome with time (Sig result = include time)
+test_time<-anova(modNULL_re, modFP2_re, test="LRT") # p-value 8.439e-07
+p_value1<-test_time$`Pr(>Chisq)`[2]
+print(paste("p=",p_value1))
+if(p_value1 < 0.05) print("Outcome is associated with time") else print("Outcome is not associated with time!")
+
+# Evidence for non-linearity (Sig result = non-linear model)
+test_linear<-anova(modLin_re, modFP2_re, test="LRT") # p-value 0.05234
+p_value2<-test_linear$`Pr(>Chisq)`[2]
+print(paste("p=",p_value2))
+if(p_value2 < 0.05) print("Non-linearity model is OK") else print("There is no evidence for non-linearity model!")
+
+# Simpler or more complex non-linear model?  (Sig result = FP2, else FP1)
+test_simple<-anova(modFP1_re, modFP2_re, test="LRT") # p-value 0.05234
+p_value3<-test_simple$`Pr(>Chisq)`[2]
+print(paste("p=",p_value3))
+if(p_value3 < 0.05) print("Better choose complex non-linear model--FP2") else print("Better choose simple non-linear model--FP1!")
+
+
+```
+
+## #Restricted cubic splines with random effects
+
+```{r Restricted cubic splines with random effects, echo=TRUE, warning=FALSE}
+#I do not know why the coefficient of random effects equals to 0, therefore, this model = origin RCS
+MODi <- 17
+# First need knot locations for up to 5 internal knots.
+# Basing these on equally-spaced percentiles of the observed (uncensored) death times.
+bc2 <- subset(niv3y, censrec==1)
+myLnL <- array(dim=5)
+myAIC <- array(dim=5)
+for (i in 1:5){
+  glmTemp <- gam(cbind(Events,AtRisk-Events) ~ s(Time, bs="cr", k=i+2, fx=TRUE) + s(MyId,bs="re") + offset(log(timedelta)), knots=list(Time=quantile(bc2$recyrs, seq(from=0, to=1, by=1/(1+i))), length=i+2), family=binomial(link=cloglog), data=ltHaz)
+  myLnL[i] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+  myAIC[i] <- extractAIC(glmTemp)[2]
+}
+RCSres <- data.frame(c("1","2","3","4","5"))
+RCSres <- cbind(RCSres,myLnL,myAIC)
+colnames(RCSres) <- c("Int.Knots","LnL","AIC")
+RCSres<-arrange(RCSres,AIC)
+RCS_k<-as.numeric(RCSres[1,1])
+i<-RCS_k
+glmTemp1 <- gam(cbind(Events,AtRisk-Events) ~ s(Time, bs="cr", k=i+2, fx=TRUE) + s(MyId,bs="re") + offset(log(timedelta)), knots=list(Time=quantile(bc2$recyrs, seq(from=0, to=1, by=1/(1+i))), length=i+2),family=binomial(link=cloglog), data=ltHaz)
+
+dfGOF[MODi,1] <- md[MODi]
+dfGOF[MODi,2] <- (extractAIC(glmTemp1)[2] - 2*extractAIC(glmTemp1)[1])*(-0.5)
+dfGOF[MODi,3] <- extractAIC(glmTemp1)[1]
+
+coeff_temp<-as.data.frame(glmTemp1$coefficients)
+  t1<-"Param"
+  for (i in 1:length(coeff_temp[,1])) {
+    t0<-paste(rownames(coeff_temp)[i],round(coeff_temp[i,1],2),sep = "=")
+    t1<-paste(t1,t0,sep = ";")
+  }
+dfGOF[MODi,5] <- paste(t1,paste("k=",RCS_k),sep = ";")
+# Hazard estimates
+dfHazEst[MODi,] <- predict(glmTemp1, newdata=Newtime, type="response")
+dfHazEst2[MODi,] <- predict(glmTemp1, newdata=Newtime2, type="response")
+ltHaz[md[MODi]] <- predict(glmTemp1, newdata=ltHaz, type="response")
+
+
+```
+
+## #Generalised additive models with random effects
+
+```{r Generalised additive models with random effects, echo=TRUE, warning=FALSE}
+#I do not know why the coefficient of random effects equals to 0, therefore, this model = origin GAM
+MODi <- 18
+# Now base knots on minimising AIC
+myLnL <- array(dim=10)
+myAIC <- array(dim=10)
+for (i in 1:10){
+  glmTemp <- gam(cbind(Events,AtRisk-Events) ~ s(Time, bs="cr", k=i+2, fx=FALSE) + s(MyId,bs="re") + offset(log(timedelta)), knots=list(Time=quantile(bc2$recyrs, seq(from=0, to=1, by=1/(1+i))), length=i+2), family=binomial(link=cloglog), data=ltHaz)
+  myLnL[i] <- (extractAIC(glmTemp)[2] - 2*extractAIC(glmTemp)[1])*(-0.5)
+  myAIC[i] <- extractAIC(glmTemp)[2]
+}
+GAMres <- data.frame(c("1","2","3","4","5"))
+GAMres <- cbind(GAMres,myLnL,myAIC)
+colnames(GAMres) <- c("Int.Knots","LnL","AIC")
+GAMres<-arrange(GAMres,AIC)
+GAM_k<-as.numeric(GAMres[1,1])
+i<-GAM_k
+glmTemp1 <- gam(cbind(Events,AtRisk-Events) ~ s(Time, bs="cr", k=i+2, fx=FALSE) + s(MyId,bs="re") + offset(log(timedelta)), knots=list(Time=quantile(bc2$recyrs, seq(from=0, to=1, by=1/(1+i))), length=i+2),family=binomial(link=cloglog), data=ltHaz)
+
+dfGOF[MODi,1] <- md[MODi]
+dfGOF[MODi,2] <- (extractAIC(glmTemp1)[2] - 2*extractAIC(glmTemp1)[1])*(-0.5)
+dfGOF[MODi,3] <- extractAIC(glmTemp1)[1]
+coeff_temp<-as.data.frame(glmTemp1$coefficients)
+  t1<-"Param"
+  for (i in 1:length(coeff_temp[,1])) {
+    t0<-paste(rownames(coeff_temp)[i],round(coeff_temp[i,1],2),sep = "=")
+    t1<-paste(t1,t0,sep = ";")
+  }
+smooth_parm<-as.data.frame(glmTemp1$sp)
+  t2<-"Smooth_Param"
+  for (i in 1:length(smooth_parm[,1])) {
+    t0<-paste(rownames(smooth_parm)[i],round(smooth_parm[i,1],2),sep = "=")
+    t2<-paste(t2,t0,sep = ";")
+  }
+dfGOF[MODi,5] <- paste(paste(t1,paste("k=",GAM_k),sep = ";"),t2,sep = ";")
+# Hazard estimates
+dfHazEst[MODi,] <- predict(glmTemp1, newdata=Newtime, type="response")
+dfHazEst2[MODi,] <- predict(glmTemp1, newdata=Newtime2, type="response")
+ltHaz[md[MODi]] <- predict(glmTemp1, newdata=ltHaz, type="response")
+
+```
+
+## #stan Dynamic survival models-local-level-local-damped
+
+```{stan Dynamic survival models-local-level-local-damped.stan,output.var="stan1",engine.path="ped.stan"}
+data {
+  int<lower=1> T;  // Time points
+  vector[T-1] tau;   // Width between time-points
+  int y[T];        // Events
+  vector[T] n;     // At risk
+}
+
+parameters {
+  real beta_01;              // Initial coeff1
+  real<lower=0> Z1;          // Variance coeff1
+  real<lower=0> Z2;          // Variance coeff2
+  real beta_02;              // Initial coeff2
+  vector[T] zeta_tilde1;      // Tranformation of zeta2 (as in 8-schools example)
+  vector[T-1] zeta_tilde2;      // Tranformation of zeta2 (as in 8-schools example)
+  real<lower=0.7, upper=0.999> phi;  // Whether or not we know phi values (don't let = 1 as messes up extrap calcs)
+}
+
+transformed parameters {
+    vector[T] beta1;         // State 1
+    vector[T-1] beta2;         // State 2
+    { // Don't want to save this
+vector[T] zeta1;         // Innovations
+vector[T-1] zeta2;         // Innovations
+
+zeta1 = sqrt(Z1) * zeta_tilde1;
+zeta2 = sqrt(Z2) * zeta_tilde2;
+beta1[1] = beta_01 + zeta1[1];;
+beta2[1] = beta_02 + zeta2[1];
+for (t in 2:T-1) {
+  beta1[t] = beta1[t-1] + beta2[t-1] * phi * tau[t-1] + zeta1[t];
+  beta2[t] = beta2[t-1] * phi + zeta2[t];
+}
+beta1[T] = beta1[T-1] + beta2[T-1] * phi * tau[T-1] + zeta1[T];
+}
+}
+
+model {
+  Z1 ~ inv_gamma(1, 0.005);
+  Z2 ~ inv_gamma(1, 0.005);
+  zeta_tilde1 ~ normal(0, 1);
+  zeta_tilde2 ~ normal(0, 1);
+  y ~ poisson(exp(beta1) .* n);
+}
+
+generated quantities{
+  real level;
+  real trend;
+  
+  level = beta1[T];
+  trend = beta2[T-1];
+}
+
+
+```
+
+## #Dynamic survival models-local-level-local-damped
+
+```{r Dynamic survival models-local-level-local-damped, echo=TRUE, message=FALSE, warning=FALSE,results='hide'}
+MODi <- 19
+rstan_options(auto_write = TRUE)
+# Below code is for fitting a local-level damped trend model. As noted in the stan file, some variations are required for fitting the other models, which would have their own files.
+
+set.seed(81466)
+
+small_num = 1*10^-5  # As sometimes everyone is dead
+
+mod_DSM = function(df){ # To add-in function for DSM models
+  df$AtRisk = case_when(df$AtRisk == 0 ~ small_num, TRUE ~ df$AtRisk)
+  df$Ln_Tau = log1p(df$Time) - lag(log1p(df$Time), default = 0) 
+  
+  my_counter <<- my_counter + 1
+  print(my_counter)
+  
+  my_data1 <- list(
+    y = df$Events,
+    T = length(df$Events),
+    n = df$AtRisk,
+    tau = tail(df$Ln_Tau, -1)
+  )
+  init_list = list(list(beta_01 = log(min(1, my_data1$y[1] / my_data1$n[1])),
+                        beta_02 = 0, Z = small_num)) # Z = small num
+  
+  fit1 <- stan(
+    file = "local-level-local-damped.stan",
+    data = my_data1,         # named list of data
+    chains = 1,              # number of Markov chains
+    warmup = 1000,           # number of warmup iterations per chain
+    iter = 2000,             # total number of iterations per chain
+    cores = 8,               # number of cores
+    init = init_list,        # Initial values for DSM models
+    refresh = 100,              # show progress every 'refresh' iterations
+    control = list(adapt_delta = 0.95, max_treedepth = 15)
+  )
+  
+  # Within-sample estimates  
+  beta1 = extract(fit1, pars = c("beta1"))
+  int_haz = map_dfr(beta1, function(x) colMeans(exp(x)))
+  tmp2 = tibble(Time = df$Time, mean = int_haz$beta1)
+  max_fu = max(tmp2$Time) # = tmp2$Time[length(tmp2$Time)] as ordered
+  time_int = filter(new_df, Time <= max_fu) 
+  int_est = approx(x=tmp2$Time, y=tmp2$mean, xout=time_int$Time, rule=2)$y
+  
+  # Extrapolations
+  # Get future tau (width) values for when to dampen trend - fit linear model to last half of data
+  df2 = mutate(df, Ind = row_number()) %>% filter(Ind > max(Ind)/2) %>% mutate(Ind = Ind - min(Ind) + 1)
+  mod_w = lm(Ln_Tau ~ Ind, data = df2)
+  tmp = data.frame(Ind = seq(from = max(df2$Ind), to = max(df2$Ind) + 1))
+  w_new = predict(mod_w, tmp) # Initital ests, to find out how long to make extrap widths.
+  new_upp = ceiling((max_h - max_fu) / (w_new[2] + max(mod_w$coefficients[2], 0)))
+  if (mod_w$coefficients[2] > 0) {
+    tmp = data.frame(Ind = seq(from = max(df2$Ind), to = max(df2$Ind) + new_upp + 1))
+    w_new = predict(mod_w, tmp)
+  } else {
+    w_new = rep(w_new[2], new_upp + 1)
+  }
+  w_df = tibble(time_new = cumsum(c(max_fu, w_new)))
+  
+  # Estimates
+  tmp_df = tibble(Time = log1p(w_df$time_new) - log1p(max_fu)) %>% mutate(level = extract(fit1, pars = c("level")),
+                                                                          trend = extract(fit1, pars = c("trend")), phi = extract(fit1, pars = c("phi")),
+                                                                          ext_est = pmap(list(level, trend, phi, Time), function(level, trend, phi, Time) exp(level + trend * phi * (1 - phi^Time)/(1 - phi))),
+                                                                          Pred = map_dbl(ext_est, mean), Time = w_df$time_new,
+                                                                          Low = map_dbl(ext_est, function(x) quantile(x, probs = 0.025)),
+                                                                          Upp = map_dbl(ext_est, function(x) quantile(x, probs = 1 - 0.025)),
+                                                                          Phi_m = map_dbl(phi, mean), Trend_m = map_dbl(trend, mean), Level_m = map_dbl(level, mean)) %>%
+    select(Time, Pred, Low, Upp, Phi_m, Trend_m, Level_m)
+  
+  fu_time = filter(new_df, Time > max_fu) %>% select(Time)
+  
+  mod_est = tibble(Time = my_time,
+                   Pred = c(int_est, approx(x = tmp_df$Time, y = tmp_df$Pred, xout = fu_time$Time)$y),
+                   Low = c(int_est, approx(x = tmp_df$Time, y = tmp_df$Low, xout = fu_time$Time)$y),
+                   Upp = c(int_est, approx(x = tmp_df$Time, y = tmp_df$Upp, xout = fu_time$Time)$y)) 
+  
+  lst = list(df = mod_est, AIC = mean(tmp_df$Phi_m), Comp = mean(tmp_df$Trend_m), level = mean(tmp_df$Level_m))
+  return(lst)
+}
+
+
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+
+my_df<-data.frame()
+max_h = 3
+new_df<-ltHaz
+my_time = ltHaz$Time
+my_counter = 0
+
+# Fit model in global environment once to avoid recompiling
+my_data <- list(
+  y = rep(1,10),
+  T = 10,
+  n = seq(10,1,-1),
+  tau = rep(1,9)
+)
+
+temp_mod <- stan(
+  file = "local-level-local-damped.stan", # Stan program
+  data = my_data,         # named list of data
+  chains = 1
+)
+
+df_models_LLLD_ltHaz <- mod_DSM(ltHaz)
+ltHaz[md[MODi]] <- df_models_LLLD_ltHaz$df$Pred
+
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+
+my_df<-data.frame()
+max_h = 6.5
+new_df<-Newtime
+my_time = Newtime$Time
+my_counter = 0
+
+df_models_LLLD_Newtime <- mod_DSM(ltHaz)
+dfHazEst[MODi,]<-df_models_LLLD_Newtime$df$Pred
+
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+
+my_df<-data.frame()
+max_h = 40
+new_df<-Newtime2
+my_time = Newtime2$Time
+my_counter = 0
+
+df_models_LLLD_Newtime2 <- mod_DSM(ltHaz)
+dfHazEst2[MODi,]<-df_models_LLLD_Newtime2$df$Pred
+
+```
+
+## #stan Dynamic survival models-global-level-local-damped
+
+```{stan Dynamic survival models-global-level-local-damped.stan, engine.path="ped.stan", output.var="stan2"}
+data {
+  int<lower=1> T;  // Time points
+  vector[T-1] tau;   // Width between time-points
+  int y[T];        // Events
+  vector[T] n;     // At risk
+}
+
+parameters {
+  real beta_01;              // Initial coeff1
+  real<lower=0> Z2;          // Variance coeff2
+  real beta_02;              // Initial coeff2
+  vector[T-1] zeta_tilde2;      // Tranformation of zeta2 (as in 8-schools example)
+  real<lower=0.7, upper=0.999> phi;  // Whether or not we know phi values (don't let = 1 as messes up extrap calcs)
+}
+
+transformed parameters {
+    vector[T] beta1;         // State 1
+    vector[T-1] beta2;         // State 2
+    { // Don't want to save this
+vector[T-1] zeta2;         // Innovations
+
+zeta2 = sqrt(Z2) * zeta_tilde2;
+beta1[1] = beta_01 ;;
+beta2[1] = beta_02 + zeta2[1];
+for (t in 2:T-1) {
+  beta1[t] = beta1[t-1] + beta2[t-1] * phi * tau[t-1] ;
+  beta2[t] = beta2[t-1] * phi + zeta2[t];
+}
+beta1[T] = beta1[T-1] + beta2[T-1] * phi * tau[T-1] ;
+}
+}
+
+model {
+  Z2 ~ inv_gamma(1, 0.005);
+  zeta_tilde2 ~ normal(0, 1);
+  y ~ poisson(exp(beta1) .* n);
+}
+
+generated quantities{
+  real level;
+  real trend;
+  
+  level = beta1[T];
+  trend = beta2[T-1];
+}
+
+```
+
+## #Dynamic survival models-global-level-local-damped
+
+```{r Dynamic survival models-global-level-local-damped, echo=TRUE, message=FALSE, warning=FALSE,results='hide'}
+MODi <- 20
+rstan_options(auto_write = TRUE)
+# Below code is for fitting a local-level damped trend model. As noted in the stan file, some variations are required for fitting the other models, which would have their own files.
+
+set.seed(81466)
+
+small_num = 1*10^-5  # As sometimes everyone is dead
+
+mod_DSM = function(df){ # To add-in function for DSM models
+  df$AtRisk = case_when(df$AtRisk == 0 ~ small_num, TRUE ~ df$AtRisk)
+  df$Ln_Tau = log1p(df$Time) - lag(log1p(df$Time), default = 0) 
+  
+  my_counter <<- my_counter + 1
+  print(my_counter)
+  
+  my_data1 <- list(
+    y = df$Events,
+    T = length(df$Events),
+    n = df$AtRisk,
+    tau = tail(df$Ln_Tau, -1)
+  )
+  init_list = list(list(beta_01 = log(min(1, my_data1$y[1] / my_data1$n[1])),
+                        beta_02 = 0, Z = small_num)) # Z = small num
+  
+  fit1 <- stan(
+    file = "global-level-local-damped.stan",
+    data = my_data1,         # named list of data
+    chains = 1,              # number of Markov chains
+    warmup = 1000,           # number of warmup iterations per chain
+    iter = 2000,             # total number of iterations per chain
+    cores = 8,               # number of cores
+    init = init_list,        # Initial values for DSM models
+    refresh = 100,              # show progress every 'refresh' iterations
+    control = list(adapt_delta = 0.95, max_treedepth = 15)
+  )
+  
+  # Within-sample estimates  
+  beta1 = extract(fit1, pars = c("beta1"))
+  int_haz = map_dfr(beta1, function(x) colMeans(exp(x)))
+  tmp2 = tibble(Time = df$Time, mean = int_haz$beta1)
+  max_fu = max(tmp2$Time) # = tmp2$Time[length(tmp2$Time)] as ordered
+  time_int = filter(new_df, Time <= max_fu) 
+  int_est = approx(x=tmp2$Time, y=tmp2$mean, xout=time_int$Time, rule=2)$y
+  
+  # Extrapolations
+  # Get future tau (width) values for when to dampen trend - fit linear model to last half of data
+  df2 = mutate(df, Ind = row_number()) %>% filter(Ind > max(Ind)/2) %>% mutate(Ind = Ind - min(Ind) + 1)
+  mod_w = lm(Ln_Tau ~ Ind, data = df2)
+  tmp = data.frame(Ind = seq(from = max(df2$Ind), to = max(df2$Ind) + 1))
+  w_new = predict(mod_w, tmp) # Initital ests, to find out how long to make extrap widths.
+  new_upp = ceiling((max_h - max_fu) / (w_new[2] + max(mod_w$coefficients[2], 0)))
+  if (mod_w$coefficients[2] > 0) {
+    tmp = data.frame(Ind = seq(from = max(df2$Ind), to = max(df2$Ind) + new_upp + 1))
+    w_new = predict(mod_w, tmp)
+  } else {
+    w_new = rep(w_new[2], new_upp + 1)
+  }
+  w_df = tibble(time_new = cumsum(c(max_fu, w_new)))
+  
+  # Estimates
+  tmp_df = tibble(Time = log1p(w_df$time_new) - log1p(max_fu)) %>% mutate(level = extract(fit1, pars = c("level")),
+                                                                          trend = extract(fit1, pars = c("trend")), phi = extract(fit1, pars = c("phi")),
+                                                                          ext_est = pmap(list(level, trend, phi, Time), function(level, trend, phi, Time) exp(level + trend * phi * (1 - phi^Time)/(1 - phi))),
+                                                                          Pred = map_dbl(ext_est, mean), Time = w_df$time_new,
+                                                                          Low = map_dbl(ext_est, function(x) quantile(x, probs = 0.025)),
+                                                                          Upp = map_dbl(ext_est, function(x) quantile(x, probs = 1 - 0.025)),
+                                                                          Phi_m = map_dbl(phi, mean), Trend_m = map_dbl(trend, mean), Level_m = map_dbl(level, mean)) %>%
+    select(Time, Pred, Low, Upp, Phi_m, Trend_m, Level_m)
+  
+  fu_time = filter(new_df, Time > max_fu) %>% select(Time)
+  
+  mod_est = tibble(Time = my_time,
+                   Pred = c(int_est, approx(x = tmp_df$Time, y = tmp_df$Pred, xout = fu_time$Time)$y),
+                   Low = c(int_est, approx(x = tmp_df$Time, y = tmp_df$Low, xout = fu_time$Time)$y),
+                   Upp = c(int_est, approx(x = tmp_df$Time, y = tmp_df$Upp, xout = fu_time$Time)$y)) 
+  
+  lst = list(df = mod_est, AIC = mean(tmp_df$Phi_m), Comp = mean(tmp_df$Trend_m), level = mean(tmp_df$Level_m))
+  return(lst)
+}
+
+
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+
+my_df<-data.frame()
+# my_df = readRDS(here("Output", paste0("df_full", part)))
+max_h = 3
+new_df<-ltHaz
+my_time = ltHaz$Time
+# new_df = tibble(Time = my_time, AtRisk = 1)
+# num_scen = length(unique(my_df$Scenario)) # Num scenarios
+my_counter = 0
+
+# Fit model in global environment once to avoid recompiling
+my_data <- list(
+  y = rep(1,10),
+  T = 10,
+  n = seq(10,1,-1),
+  tau = rep(1,9)
+)
+
+temp_mod <- stan(
+  file = "global-level-local-damped.stan", # Stan program
+  data = my_data,         # named list of data
+  chains = 1
+)
+
+df_models_GLLD_ltHaz <- mod_DSM(ltHaz)
+ltHaz[md[MODi]] <- df_models_GLLD_ltHaz$df$Pred
+
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+
+my_df<-data.frame()
+# my_df = readRDS(here("Output", paste0("df_full", part)))
+max_h = 6.5
+new_df<-Newtime
+my_time = Newtime$Time
+# new_df = tibble(Time = my_time, AtRisk = 1)
+# num_scen = length(unique(my_df$Scenario)) # Num scenarios
+my_counter = 0
+
+df_models_GLLD_Newtime <- mod_DSM(ltHaz)
+dfHazEst[MODi,]<-df_models_GLLD_Newtime$df$Pred
+
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+
+my_df<-data.frame()
+# my_df = readRDS(here("Output", paste0("df_full", part)))
+max_h = 40
+new_df<-Newtime2
+my_time = Newtime2$Time
+# new_df = tibble(Time = my_time, AtRisk = 1)
+# num_scen = length(unique(my_df$Scenario)) # Num scenarios
+my_counter = 0
+
+df_models_GLLD_Newtime2 <- mod_DSM(ltHaz)
+dfHazEst2[MODi,]<-df_models_GLLD_Newtime2$df$Pred
+
+```
+
+## #stan Dynamic survival models-local-level-local-trend
+
+```{stan Dynamic survival models-local-level-local-trend.stan,output.var="stan3", engine.path="ped.stan"}
+data {
+  int<lower=1> T;  // Time points
+  vector[T-1] tau;   // Width between time-points
+  int y[T];        // Events
+  vector[T] n;     // At risk
+}
+
+parameters {
+  real beta_01;              // Initial coeff1
+  real<lower=0> Z1;          // Variance coeff1
+  real<lower=0> Z2;          // Variance coeff2
+  real beta_02;              // Initial coeff2
+  vector[T] zeta_tilde1;      // Tranformation of zeta2 (as in 8-schools example)
+  vector[T-1] zeta_tilde2;      // Tranformation of zeta2 (as in 8-schools example)
+}
+
+transformed parameters {
+    vector[T] beta1;         // State 1
+    vector[T-1] beta2;         // State 2
+    { // Don't want to save this
+vector[T] zeta1;         // Innovations
+vector[T-1] zeta2;         // Innovations
+
+zeta1 = sqrt(Z1) * zeta_tilde1;
+zeta2 = sqrt(Z2) * zeta_tilde2;
+beta1[1] = beta_01 + zeta1[1];;
+beta2[1] = beta_02 + zeta2[1];
+for (t in 2:T-1) {
+  beta1[t] = beta1[t-1]  + zeta1[t];
+  beta2[t] =   zeta2[t];
+}
+beta1[T] = beta1[T-1] + zeta1[T];
+}
+}
+
+model {
+  Z1 ~ inv_gamma(1, 0.005);
+  Z2 ~ inv_gamma(1, 0.005);
+  zeta_tilde1 ~ normal(0, 1);
+  zeta_tilde2 ~ normal(0, 1);
+  y ~ poisson(exp(beta1) .* n);
+}
+
+generated quantities{
+  real level;
+  real trend;
+  
+  level = beta1[T];
+  trend = beta2[T-1];
+}
+
+```
+
+## #Dynamic survival models-local-level-local-trend
+
+```{r Dynamic survival models-local-level-local-trend, echo=TRUE, message=FALSE, warning=FALSE,results='hide'}
+MODi <- 21
+rstan_options(auto_write = TRUE)
+# Below code is for fitting a local-level damped trend model. As noted in the stan file, some variations are required for fitting the other models, which would have their own files.
+
+set.seed(81466)
+
+small_num = 1*10^-5  # As sometimes everyone is dead
+
+mod_DSM = function(df){ # To add-in function for DSM models
+  df$AtRisk = case_when(df$AtRisk == 0 ~ small_num, TRUE ~ df$AtRisk)
+  df$Ln_Tau = log1p(df$Time) - lag(log1p(df$Time), default = 0) 
+  
+  my_counter <<- my_counter + 1
+  print(my_counter)
+  
+  my_data1 <- list(
+    y = df$Events,
+    T = length(df$Events),
+    n = df$AtRisk,
+    tau = tail(df$Ln_Tau, -1)
+  )
+  init_list = list(list(beta_01 = log(min(1, my_data1$y[1] / my_data1$n[1])),
+                        beta_02 = 0, Z = small_num)) # Z = small num
+  
+  fit1 <- stan(
+    file = "local-level-local-trend.stan",
+    data = my_data1,         # named list of data
+    chains = 1,              # number of Markov chains
+    warmup = 1000,           # number of warmup iterations per chain
+    iter = 2000,             # total number of iterations per chain
+    cores = 8,               # number of cores
+    init = init_list,        # Initial values for DSM models
+    refresh = 100,              # show progress every 'refresh' iterations
+    control = list(adapt_delta = 0.95, max_treedepth = 15)
+  )
+  
+  # Within-sample estimates  
+  beta1 = extract(fit1, pars = c("beta1"))
+  int_haz = map_dfr(beta1, function(x) colMeans(exp(x)))
+  tmp2 = tibble(Time = df$Time, mean = int_haz$beta1)
+  max_fu = max(tmp2$Time) # = tmp2$Time[length(tmp2$Time)] as ordered
+  time_int = filter(new_df, Time <= max_fu) 
+  int_est = approx(x=tmp2$Time, y=tmp2$mean, xout=time_int$Time, rule=2)$y
+  
+  # Extrapolations
+  # Get future tau (width) values for when to dampen trend - fit linear model to last half of data
+  df2 = mutate(df, Ind = row_number()) %>% filter(Ind > max(Ind)/2) %>% mutate(Ind = Ind - min(Ind) + 1)
+  mod_w = lm(Ln_Tau ~ Ind, data = df2)
+  tmp = data.frame(Ind = seq(from = max(df2$Ind), to = max(df2$Ind) + 1))
+  w_new = predict(mod_w, tmp) # Initital ests, to find out how long to make extrap widths.
+  new_upp = ceiling((max_h - max_fu) / (w_new[2] + max(mod_w$coefficients[2], 0)))
+  if (mod_w$coefficients[2] > 0) {
+    tmp = data.frame(Ind = seq(from = max(df2$Ind), to = max(df2$Ind) + new_upp + 1))
+    w_new = predict(mod_w, tmp)
+  } else {
+    w_new = rep(w_new[2], new_upp + 1)
+  }
+  w_df = tibble(time_new = cumsum(c(max_fu, w_new)))
+  
+  # Estimates
+  tmp_df = tibble(Time = log1p(w_df$time_new) - log1p(max_fu)) %>% mutate(level = extract(fit1, pars = c("level")),
+                                                                          trend = extract(fit1, pars = c("trend")),
+                                                                          ext_est = pmap(list(level, trend,Time), function(level, trend, Time) exp(level)),
+                                                                          Pred = map_dbl(ext_est, mean), Time = w_df$time_new,
+                                                                          Low = map_dbl(ext_est, function(x) quantile(x, probs = 0.025)),
+                                                                          Upp = map_dbl(ext_est, function(x) quantile(x, probs = 1 - 0.025)),
+                                                                          Trend_m = map_dbl(trend, mean), Level_m = map_dbl(level, mean)) %>%
+    select(Time, Pred, Low, Upp, Trend_m, Level_m)
+  
+  fu_time = filter(new_df, Time > max_fu) %>% select(Time)
+  
+  mod_est = tibble(Time = my_time,
+                   Pred = c(int_est, approx(x = tmp_df$Time, y = tmp_df$Pred, xout = fu_time$Time)$y),
+                   Low = c(int_est, approx(x = tmp_df$Time, y = tmp_df$Low, xout = fu_time$Time)$y),
+                   Upp = c(int_est, approx(x = tmp_df$Time, y = tmp_df$Upp, xout = fu_time$Time)$y)) 
+  
+  lst = list(df = mod_est, Comp = mean(tmp_df$Trend_m), level = mean(tmp_df$Level_m))
+  return(lst)
+}
+
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+
+my_df<-data.frame()
+max_h = 3
+new_df<-ltHaz
+my_time = ltHaz$Time
+my_counter = 0
+
+# Fit model in global environment once to avoid recompiling
+my_data <- list(
+  y = rep(1,10),
+  T = 10,
+  n = seq(10,1,-1),
+  tau = rep(1,9)
+)
+
+temp_mod <- stan(
+  file = "local-level-local-trend.stan", # Stan program
+  data = my_data,         # named list of data
+  chains = 1
+)
+
+df_models_LLLT_ltHaz <- mod_DSM(ltHaz)
+ltHaz[md[MODi]] <- df_models_LLLT_ltHaz$df$Pred
+
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+
+my_df<-data.frame()
+max_h = 6.5
+new_df<-Newtime
+my_time = Newtime$Time
+my_counter = 0
+
+df_models_LLLT_Newtime <- mod_DSM(ltHaz)
+dfHazEst[MODi,]<-df_models_LLLT_Newtime$df$Pred
+
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+
+my_df<-data.frame()
+max_h = 40
+new_df<-Newtime2
+my_time = Newtime2$Time
+my_counter = 0
+
+df_models_LLLT_Newtime2 <- mod_DSM(ltHaz)
+dfHazEst2[MODi,]<-df_models_LLLT_Newtime2$df$Pred
+
+```
+
+## #stan Dynamic survival models-global-level-local-trend
+
+```{stan Dynamic survival models-global-level-local-trend.stan,output.var="stan4", engine.path="ped.stan"}
+data {
+  int<lower=1> T;  // Time points
+  vector[T-1] tau;   // Width between time-points
+  int y[T];        // Events
+  vector[T] n;     // At risk
+}
+
+parameters {
+  real beta_01;              // Initial coeff1
+  real<lower=0> Z2;          // Variance coeff2
+  real beta_02;              // Initial coeff2
+  vector[T-1] zeta_tilde2;      // Tranformation of zeta2 (as in 8-schools example)
+}
+
+transformed parameters {
+    vector[T] beta1;         // State 1
+    vector[T-1] beta2;         // State 2
+    { // Don't want to save this
+vector[T-1] zeta2;         // Innovations
+
+zeta2 = sqrt(Z2) * zeta_tilde2;
+beta1[1] = beta_01 ;;
+beta2[1] = beta_02 + zeta2[1];
+for (t in 2:T-1) {
+  beta1[t] = beta1[t-1] ;
+  beta2[t] = zeta2[t];
+}
+beta1[T] = beta1[T-1] ;
+}
+}
+
+model {
+  Z2 ~ inv_gamma(1, 0.005);
+  zeta_tilde2 ~ normal(0, 1);
+  y ~ poisson(exp(beta1) .* n);
+}
+
+generated quantities{
+  real level;
+  real trend;
+  
+  level = beta1[T];
+  trend = beta2[T-1];
+}
+
+```
+
+## #Dynamic survival models-global-level-local-trend
+
+```{r Dynamic survival models-global-level-local-trend, echo=TRUE, message=FALSE, warning=FALSE,results='hide'}
+MODi <- 22
+rstan_options(auto_write = TRUE)
+# Below code is for fitting a local-level damped trend model. As noted in the stan file, some variations are required for fitting the other models, which would have their own files.
+
+set.seed(81466)
+
+small_num = 1*10^-5  # As sometimes everyone is dead
+
+mod_DSM = function(df){ # To add-in function for DSM models
+  df$AtRisk = case_when(df$AtRisk == 0 ~ small_num, TRUE ~ df$AtRisk)
+  df$Ln_Tau = log1p(df$Time) - lag(log1p(df$Time), default = 0) 
+  
+  my_counter <<- my_counter + 1
+  print(my_counter)
+  
+  my_data1 <- list(
+    y = df$Events,
+    T = length(df$Events),
+    n = df$AtRisk,
+    tau = tail(df$Ln_Tau, -1)
+  )
+  init_list = list(list(beta_01 = log(min(1, my_data1$y[1] / my_data1$n[1])),
+                        beta_02 = 0, Z = small_num)) # Z = small num
+  
+  fit1 <- stan(
+    file = "global-level-local-trend.stan",
+    data = my_data1,         # named list of data
+    chains = 1,              # number of Markov chains
+    warmup = 1000,           # number of warmup iterations per chain
+    iter = 2000,             # total number of iterations per chain
+    cores = 8,               # number of cores
+    init = init_list,        # Initial values for DSM models
+    refresh = 100,              # show progress every 'refresh' iterations
+    control = list(adapt_delta = 0.95, max_treedepth = 15)
+  )
+  
+  # Within-sample estimates  
+  beta1 = extract(fit1, pars = c("beta1"))
+  int_haz = map_dfr(beta1, function(x) colMeans(exp(x)))
+  tmp2 = tibble(Time = df$Time, mean = int_haz$beta1)
+  max_fu = max(tmp2$Time) # = tmp2$Time[length(tmp2$Time)] as ordered
+  time_int = filter(new_df, Time <= max_fu) 
+  int_est = approx(x=tmp2$Time, y=tmp2$mean, xout=time_int$Time, rule=2)$y
+  
+  # Extrapolations
+  # Get future tau (width) values for when to dampen trend - fit linear model to last half of data
+  df2 = mutate(df, Ind = row_number()) %>% filter(Ind > max(Ind)/2) %>% mutate(Ind = Ind - min(Ind) + 1)
+  mod_w = lm(Ln_Tau ~ Ind, data = df2)
+  tmp = data.frame(Ind = seq(from = max(df2$Ind), to = max(df2$Ind) + 1))
+  w_new = predict(mod_w, tmp) # Initital ests, to find out how long to make extrap widths.
+  new_upp = ceiling((max_h - max_fu) / (w_new[2] + max(mod_w$coefficients[2], 0)))
+  if (mod_w$coefficients[2] > 0) {
+    tmp = data.frame(Ind = seq(from = max(df2$Ind), to = max(df2$Ind) + new_upp + 1))
+    w_new = predict(mod_w, tmp)
+  } else {
+    w_new = rep(w_new[2], new_upp + 1)
+  }
+  w_df = tibble(time_new = cumsum(c(max_fu, w_new)))
+  
+  # Estimates
+  tmp_df = tibble(Time = log1p(w_df$time_new) - log1p(max_fu)) %>% mutate(level = extract(fit1, pars = c("level")),
+                                                                          trend = extract(fit1, pars = c("trend")),
+                                                                          ext_est = pmap(list(level, trend,Time), function(level, trend, Time) exp(level)),
+                                                                          Pred = map_dbl(ext_est, mean), Time = w_df$time_new,
+                                                                          Low = map_dbl(ext_est, function(x) quantile(x, probs = 0.025)),
+                                                                          Upp = map_dbl(ext_est, function(x) quantile(x, probs = 1 - 0.025)),
+                                                                          Trend_m = map_dbl(trend, mean), Level_m = map_dbl(level, mean)) %>%
+    select(Time, Pred, Low, Upp, Trend_m, Level_m)
+  
+  fu_time = filter(new_df, Time > max_fu) %>% select(Time)
+  
+  mod_est = tibble(Time = my_time,
+                   Pred = c(int_est, approx(x = tmp_df$Time, y = tmp_df$Pred, xout = fu_time$Time)$y),
+                   Low = c(int_est, approx(x = tmp_df$Time, y = tmp_df$Low, xout = fu_time$Time)$y),
+                   Upp = c(int_est, approx(x = tmp_df$Time, y = tmp_df$Upp, xout = fu_time$Time)$y)) 
+  
+  lst = list(df = mod_est, Comp = mean(tmp_df$Trend_m), level = mean(tmp_df$Level_m))
+  return(lst)
+}
+
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+
+my_df<-data.frame()
+max_h = 3
+new_df<-ltHaz
+my_time = ltHaz$Time
+my_counter = 0
+
+# Fit model in global environment once to avoid recompiling
+my_data <- list(
+  y = rep(1,10),
+  T = 10,
+  n = seq(10,1,-1),
+  tau = rep(1,9)
+)
+
+temp_mod <- stan(
+  file = "global-level-local-trend.stan", # Stan program
+  data = my_data,         # named list of data
+  chains = 1
+)
+
+df_models_GLLT_ltHaz <- mod_DSM(ltHaz)
+ltHaz[md[MODi]] <- df_models_GLLT_ltHaz$df$Pred
+
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+
+my_df<-data.frame()
+max_h = 6.5
+new_df<-Newtime
+my_time = Newtime$Time
+my_counter = 0
+
+df_models_GLLT_Newtime <- mod_DSM(ltHaz)
+dfHazEst[MODi,]<-df_models_GLLT_Newtime$df$Pred
+
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------------------#
+
+my_df<-data.frame()
+max_h = 40
+new_df<-Newtime2
+my_time = Newtime2$Time
+my_counter = 0
+
+df_models_GLLT_Newtime2 <- mod_DSM(ltHaz)
+dfHazEst2[MODi,]<-df_models_GLLT_Newtime2$df$Pred
+
+```
+
+## #dfGOF process of Dynamic survival models
+
+```{r dfGOF process of Dynamic survival models, echo=TRUE}
+for (MODi in 19:22) {
+  dfGOF[MODi,1] <- md[MODi]
+  dfGOF[MODi,2] <- 0
+  dfGOF[MODi,3] <- 0
+  dfGOF[MODi,5] <- 0
+}
+```
+
+## #Dynamic survival models-DGLM
+
+```{r Dynamic survival models-DGLM, echo=TRUE}
+logTime <-ltHaz[,1:4]
+colnames(logTime) <- c("Hazard","Time","AtRisk","Events")
+
+# Now for models. Considering 3:
+# modLvl = local level, no trend.
+# modTrnd = local level and local trend
+# modDrift = local level and global trend
+
+# Define model structures
+strcLvl <- SSModel(logTime$Events ~ -1 + 
+                     SSMtrend(degree = 1, Q = list(matrix(NA))),
+                   distribution="poisson", u=logTime$AtRisk)
+strcTrnd <- SSModel(logTime$Events ~ -1 + 
+                      SSMtrend(degree = 2, Q = list(matrix(NA), matrix(NA))),
+                    distribution="poisson", u=logTime$AtRisk)
+strcDrft <- SSModel(logTime$Events ~ -1 + 
+                      SSMtrend(degree = 2, Q = list(matrix(NA), matrix(0))),
+                    distribution="poisson", u=logTime$AtRisk)
+# Now fit and get estimates (N.B. for replication using nsim = 0, that is Gaussian approximation only)
+modLvl <- fitSSM(strcLvl, c(0.01), method = "BFGS")$model
+estLvl <- KFS(modLvl, nsim = 0)
+modTrnd <- fitSSM(strcTrnd, c(0.01,0.01), method = "BFGS")$model
+estTrnd <- KFS(modTrnd, nsim = 0)
+modDrft <- fitSSM(strcDrft, c(0.01,0.01), method = "BFGS")$model
+estDrft <- KFS(modDrft, nsim = 0) 
+# Get extrapolations (note will be in equally spaced log-time increments)
+predLvl <- data.frame(predict(object=modLvl,
+                              newdata = SSModel(ts(matrix(NA, 40*12-follow_up, 1), start = 1) ~ -1 +
+                                                  SSMtrend(degree = 1, Q = list(matrix(modLvl$Q[1]))),
+                                                distribution="poisson", u=1),
+                              type = "response", interval = "confidence", nsim = 0))
+predTrnd <- data.frame(predict(object=modTrnd,
+                               newdata = SSModel(ts(matrix(NA, 40*12-follow_up, 1), start = 1) ~ -1 +
+                                                   SSMtrend(degree = 2, Q = list(matrix(modTrnd$Q[1]), matrix(modTrnd$Q[4]))),
+                                                 distribution="poisson", u=1),
+                               type = "response", interval = "confidence", nsim = 0))
+predDrft <- data.frame(predict(object=modDrft,
+                               newdata = SSModel(ts(matrix(NA, 40*12-follow_up, 1), start = 1) ~ -1 +
+                                                   SSMtrend(degree = 2, Q = list(matrix(modDrft$Q[1]), matrix(modDrft$Q[4]))),
+                                                 distribution="poisson", u=1),
+                               type = "response", interval = "confidence", nsim = 0))
+
+# Generate hazard for observed period - again in log-time
+estDLM <- data.frame(Level = estLvl$muhat/logTime$AtRisk, Trend = estTrnd$muhat/logTime$AtRisk,
+                     Drift = estDrft$muhat/logTime$AtRisk, Time = logTime$Time)
+
+# Find the log-times used for extrapolations
+# First get the 'step size' for predictions
+step <- estDLM$Time[2] - estDLM$Time[1]
+# Collate predictions
+pred <- data.frame(Level = predLvl$fit, Trend = predTrnd$fit, Drift = predDrft$fit)
+# Include time period & change to usual scale
+pred$Time <- estDLM$Time[dim(estDLM)[1]] + index(pred)*step
+# pred$Time <- exp(pred$logTime)
+# Keep observations for times < 40
+pred2 <- subset(pred, Time < 40)
+# Append observed and predicted times
+dfDGLM <- rbind(estDLM, pred2)
+# Note for above estimating hazard seperately, as time is handled differently in predict function
+
+MODi <- 23
+ltHaz[md[MODi]] <- dfDGLM$Level[1:36]
+Level <- ltHaz$AtRisk * approx(x=dfDGLM$Time, y=dfDGLM$Level, xout=ltHaz$Time)$y
+dfGOF[MODi,1] <- md[MODi]
+dfGOF[MODi,2] <- sum(ltHaz$Events*log(Level/ltHaz$AtRisk) - Level) + llCons
+dfGOF[MODi,3] <- 3
+dfGOF[MODi,5] <- NA
+dfHazEst[MODi,] <- dfDGLM$Level[1:78]
+dfHazEst2[MODi,] <- dfDGLM$Level[1:480]
+
+MODi <- 24
+ltHaz[md[MODi]] <- dfDGLM$Trend[1:36]
+Trend <- ltHaz$AtRisk * approx(x=dfDGLM$Time, y=dfDGLM$Trend, xout=ltHaz$Time)$y
+dfGOF[MODi,1] <- md[MODi]
+dfGOF[MODi,2] <- sum(ltHaz$Events*log(Trend/ltHaz$AtRisk) - Trend) + llCons
+dfGOF[MODi,3] <- 5
+dfGOF[MODi,5] <- NA
+dfHazEst[MODi,] <- dfDGLM$Trend[1:78]
+dfHazEst2[MODi,] <- dfDGLM$Trend[1:480]
+MODi <- 25
+ltHaz[md[MODi]] <- dfDGLM$Drift[1:36]
+Drift <- ltHaz$AtRisk * approx(x=dfDGLM$Time, y=dfDGLM$Drift, xout=ltHaz$Time)$y
+dfGOF[MODi,1] <- md[MODi]
+dfGOF[MODi,2] <- sum(ltHaz$Events*log(Drift/ltHaz$AtRisk) - Drift) + llCons
+dfGOF[MODi,3] <- 4
+dfGOF[MODi,5] <- NA
+dfHazEst[MODi,] <- dfDGLM$Drift[1:78]
+dfHazEst2[MODi,] <- dfDGLM$Drift[1:480]
+
+```
+
+## #Cure models
+
+```{r Cure models, echo=TRUE}
+# reference to code-22-06-27.rmd
+# flexsurecure,cuRe--weibull/lnorm/RP--mix/non-mix
+# RP is not the same package as weibull and lnorm, therefore it is hard to realize automatic
+# finally cuRe was selected for all models; flexsurvcure has too many problems
+# extrapolation for flexsurvcure has some problems;summary hazard equals to the hazard calculated by the cuRe
+# h_wei vs df_mod_1_test$Pred - df_mod_1_test$Haz_pop
+# Becides, non-mix cure model has some problems in calculation overall survival, which depends on basic population survival
+
+df_cure<-data.frame(niv5y$recyrs,4,niv3y$censrec,niv3y$recyrs)
+colnames(df_cure)<-c("Tru_surv","Follow_Up","Censor","Obs_surv")
+## general cure rate
+# Function to convert between rates and probability
+haz_rate = function(x, t, out = "prob"){ 
+  tmp  = t - lag(t, default = 0)
+  if (out == "rate"){
+    y = case_when(x == 1 ~ 1, TRUE ~ - (log(1 - x)) / tmp)
+  } else if (out == "prob") {
+    y = 1 - exp(- x * tmp)
+  } else {
+    "error!"
+  }
+  return (y)
+}
+# England 2016  # should be changed
+Eng_HMD = read.table(here("UK_HMDv2.txt"), header=TRUE)
+Eng_2016 = filter(Eng_HMD, Year == 2016) %>% mutate(tmp = Age,
+                                                    Age = as.numeric(tmp)[tmp],
+                                                    Hazard = haz_rate(qx, 1, "rate"),  # All observations 1 unit apart
+                                                    Surv = (lx - dx) / lx[1],
+                                                    Years = Age - 62)
+tmp = select(Eng_2016, Year, Age, Hazard)
+
+# general information
+my_time<-ltHaz$Time
+my_time2<-Newtime$Time
+my_time3<-Newtime2$Time
+
+df_GP1 = tibble(Time = my_time, 
+                Haz_pop = approx(x = Eng_2016$Years, y = Eng_2016$Hazard, xout = my_time, method = "constant")$y,
+                Srv_pop = approx(x = Eng_2016$Years, y = Eng_2016$Surv, xout = my_time, method = "constant")$y)
+df_GP2 = tibble(Time = my_time2, 
+                Haz_pop = approx(x = Eng_2016$Years, y = Eng_2016$Hazard, xout = my_time2, method = "constant")$y,
+                Srv_pop = approx(x = Eng_2016$Years, y = Eng_2016$Surv, xout = my_time2, method = "constant")$y)
+df_GP3 = tibble(Time = my_time3, 
+                Haz_pop = approx(x = Eng_2016$Years, y = Eng_2016$Hazard, xout = my_time3, method = "constant")$y,
+                Srv_pop = approx(x = Eng_2016$Years, y = Eng_2016$Surv, xout = my_time3, method = "constant")$y)
+# ipd data
+#my_time = seq(from=0.25, to=7.5, by=0.05) # Time values for which we want estimates.
+my_df_ipd<-df_cure
+my_df_ipd=my_df_ipd %>% mutate(Year = 2016, Age = floor(62 + Obs_surv))
+my_df_ipd<-left_join(my_df_ipd, tmp, by = c("Year", "Age"))
+
+###-----------------------------------------------------######-----------------------------------------------------######-----------------------------------------------------###
+###-----------------------------------------------------######-----------------------------------------------------######-----------------------------------------------------###
+myLnL <- array(dim=6)
+myPram<-array(dim=6)
+myAIC <- array(dim=6)
+myPS<-array(dim=6)
+
+###-----------------------------------------------------###
+###               mixture  cure   model
+###-----------------------------------------------------###
+### weibull CuRe
+df <- my_df_ipd
+best_wei <- fit.cure.model(Surv(Obs_surv, Censor) ~ 1, data = df, bhazard = "Hazard",formula.surv = list(~ 1, ~ 1), dist = "weibull")
+myLnL[1] <- best_wei$ML
+myPram[1]<- length(best_wei$coefs)
+myAIC[1] <- 2*(length(best_wei$coefs) + -best_wei$ML)
+cure_p1 <- predict(best_wei, type = "curerate")[[1]]$Estimate
+#   Save data on hazard and survival for those with disease (uncured)
+df_best_wei <- tibble(Time = my_time, Srv_dis = predict(best_wei, type = "survuncured", time = my_time)[[1]]$Estimate,
+             Haz_dis = predict(best_wei, type = "hazarduncured", time = my_time)[[1]]$Estimate)
+t_cw<-"Param"
+for (i in 1:length(best_wei$coefs)) {
+  t0<-paste(paste("coefs",i,sep = "-"),round(best_wei$coefs[[i]],4),sep = "=")
+  t_cw<-paste(t_cw,t0,sep = ";")
+}
+t_cw<-paste(t_cw,paste("cure_p",round(cure_p1,4),sep = ":"),sep = ";")
+myPS[1]<-t_cw
+### Lnorm CuRe
+df <- my_df_ipd
+best_lnorm <- fit.cure.model(Surv(Obs_surv, Censor) ~ 1, data = df, bhazard = "Hazard",formula.surv = list(~ 1, ~ 1), dist = "lognormal")
+myLnL[2] <- best_lnorm$ML
+myPram[2]<- length(best_lnorm$coefs)
+myAIC[2] <- 2*(length(best_lnorm$coefs) + -best_lnorm$ML)
+cure_p2 <- predict(best_lnorm, type = "curerate")[[1]]$Estimate
+#   Save data on hazard and survival for those with disease (uncured)
+df_best_lnorm <- tibble(Time = my_time, Srv_dis = predict(best_lnorm, type = "survuncured", time = my_time)[[1]]$Estimate,
+                      Haz_dis = predict(best_lnorm, type = "hazarduncured", time = my_time)[[1]]$Estimate)
+t_cl<-"Param"
+for (i in 1:length(best_lnorm$coefs)) {
+  t0<-paste(paste("coefs",i,sep = "-"),round(best_lnorm$coefs[[i]],4),sep = "=")
+  t_cl<-paste(t_cl,t0,sep = ";")
+}
+t_cl<-paste(t_cl,paste("cure_p",round(cure_p2,4),sep = ":"),sep = ";")
+myPS[2]<-t_cl
+
+### RP CuRe
+max_k<-5
+df <- my_df_ipd
+my_k = 1
+myAIC <- array(dim=5)
+for(i in 1:max_k){
+  tmp = GenFlexCureModel(Surv(Obs_surv, Censor) ~ 1, data = df, bhazard = "Hazard", df= i, verbose = FALSE)
+  tmp_AIC = 2*(length(tmp$coefs) + length(tmp$coefs.spline) + tmp$NegMaxLik)
+  myAIC[i]<-tmp_AIC
+}
+kmin<-which.min(myAIC)
+
+best_RP<-GenFlexCureModel(Surv(Obs_surv, Censor) ~ 1, data = df, bhazard = "Hazard", df= kmin, verbose = FALSE)
+myAIC[3]<-2*(length(best_RP$coefs) + length(best_RP$coefs.spline) + best_RP$NegMaxLik)
+myLnL[3]<--best_RP$NegMaxLik
+myPram[3]<-length(best_RP$coefs) + length(best_RP$coefs.spline)
+cure_p_mc <- predict(best_RP, type = "curerate")[[1]]$Estimate
+# Save data on hazard and survival for those with disease (uncured)
+df_RPcure = tibble(Time = my_time, Srv_dis = predict(best_RP, type = "survuncured", time = my_time)[[1]]$Estimate,
+            Haz_dis = predict(best_RP, type = "hazarduncured", time = my_time)[[1]]$Estimate)
+t_RP<-"Param"
+for (i in 1:length(best_RP$coefs)) {
+  t0<-paste(paste("coefs",i,sep = "-"),round(best_RP$coefs[i],4),sep = "=")
+  t_RP<-paste(t_RP,t0,sep = ";")
+}
+for (i in 1:length(best_RP$coefs.spline)) {
+  t0<-paste(paste("coefs-spline",i,sep = "-"),round(best_RP$coefs.spline[i],4),sep = "=")
+  t_RP<-paste(t_RP,t0,sep = ";")
+}
+t_RP<-paste(t_RP,paste("cure_p",round(cure_p_mc,4),sep = ":"),sep = ";")
+myPS[3]<-t_RP
+
+
+###-----------------------------------------------------###
+###           non   mixture  cure   model
+###-----------------------------------------------------###
+### weibull nCuRe
+df <- my_df_ipd
+best_wei2 <- fit.cure.model(Surv(Obs_surv, Censor) ~ 1, type = "nmixture",link= "loglog",data = df, bhazard = "Hazard",formula.surv = list(~ 1, ~ 1), dist = "weibull")
+myLnL[4] <- best_wei2$ML
+myPram[4]<- length(best_wei2$coefs)
+myAIC[4] <- 2*(length(best_wei2$coefs) + -best_wei2$ML)
+cure_p3 <- predict(best_wei2, type = "curerate")[[1]]$Estimate
+#   Save data on hazard and survival for those with disease (uncured)
+df_best_wei2 <- tibble(Time = my_time, Srv_dis = predict(best_wei2, type = "survuncured", time = my_time)[[1]]$Estimate,
+                      Haz_dis = predict(best_wei2, type = "hazarduncured", time = my_time)[[1]]$Estimate)
+t_ncw<-"Param"
+for (i in 1:length(best_wei2$coefs)) {
+  t0<-paste(paste("coefs",i,sep = "-"),round(best_wei2$coefs[[i]],4),sep = "=")
+  t_ncw<-paste(t_ncw,t0,sep = ";")
+}
+t_ncw<-paste(t_ncw,paste("cure_p",round(cure_p3,4),sep = ":"),sep = ";")
+myPS[4]<-t_ncw
+
+### Lnorm nCuRe
+df <- my_df_ipd
+best_lnorm2 <- fit.cure.model(Surv(Obs_surv, Censor) ~ 1, type = "nmixture", link= "loglog", data = df, bhazard = "Hazard",formula.surv = list(~ 1, ~ 1), dist = "lognormal")
+myLnL[5] <- best_lnorm2$ML
+myPram[5]<- length(best_lnorm2$coefs)
+myAIC[5] <- 2*(length(best_lnorm2$coefs) + -best_lnorm2$ML)
+cure_p4 <- predict(best_lnorm2, type = "curerate")[[1]]$Estimate
+#   Save data on hazard and survival for those with disease (uncured)
+df_best_lnorm2 <- tibble(Time = my_time, Srv_dis = predict(best_lnorm2, type = "survuncured", time = my_time)[[1]]$Estimate,
+                       Haz_dis = predict(best_lnorm2, type = "hazarduncured", time = my_time)[[1]]$Estimate)
+t_ncl<-"Param"
+for (i in 1:length(best_lnorm2$coefs)) {
+  t0<-paste(paste("coefs",i,sep = "-"),round(best_lnorm2$coefs[[i]],4),sep = "=")
+  t_ncl<-paste(t_ncl,t0,sep = ";")
+}
+t_ncl<-paste(t_ncl,paste("cure_p",round(cure_p4,4),sep = ":"),sep = ";")
+myPS[5]<-t_ncl
+
+### RP nCuRe
+max_k<-5
+df <- my_df_ipd
+myAIC <- array(dim=5)
+for(i in 1:max_k){
+  tmp = GenFlexCureModel(Surv(Obs_surv, Censor) ~ 1, type = "nmixture", link.type.cr = "loglog", data = df, bhazard = "Hazard", df= i, verbose = FALSE)
+  tmp_AIC = 2*(length(tmp$coefs) + length(tmp$coefs.spline) + tmp$NegMaxLik)
+  myAIC[i]<-tmp_AIC
+}
+kmin<-which.min(myAIC)
+
+best_RP2<-GenFlexCureModel(Surv(Obs_surv, Censor) ~ 1, type = "nmixture", data = df, bhazard = "Hazard", df= kmin, verbose = FALSE)
+myAIC[6]<-2*(length(best_RP2$coefs) + length(best_RP2$coefs.spline) + best_RP2$NegMaxLik)
+myLnL[6]<--best_RP2$NegMaxLik
+myPram[6]<-length(best_RP2$coefs) + length(best_RP2$coefs.spline)
+cure_p_nmc <- predict(best_RP2, type = "curerate")[[1]]$Estimate
+# Save data on hazard and survival for those with disease (uncured)
+df_RPncure = tibble(Time = my_time, Srv_dis = predict(best_RP2, type = "survuncured", time = my_time)[[1]]$Estimate,
+                   Haz_dis = predict(best_RP2, type = "hazarduncured", time = my_time)[[1]]$Estimate)
+t_RP2<-"Param"
+for (i in 1:length(best_RP2$coefs)) {
+  t0<-paste(paste("coefs",i,sep = "-"),round(best_RP2$coefs[i],4),sep = "=")
+  t_RP2<-paste(t_RP2,t0,sep = ";")
+}
+for (i in 1:length(best_RP2$coefs.spline)) {
+  t0<-paste(paste("coefs-spline",i,sep = "-"),round(best_RP2$coefs.spline[i],4),sep = "=")
+  t_RP2<-paste(t_RP2,t0,sep = ";")
+}
+t_RP2<-paste(t_RP2,paste("cure_p",round(cure_p_nmc,4),sep = ":"),sep = ";")
+myPS[6]<-t_RP2
+
+cm_name<-c("mix-wei","mix-lnorm","mix-RP","nmix-wei","nmix-lnorm","nmix-RP")
+cm_res<-cbind(cm_name,myLnL,myPram,myAIC,myPS)
+cm_res<-as.data.frame(cm_res)
+mcm<-cm_res[1:3,]
+nmcm<-cm_res[4:6,]
+mcm<-arrange(mcm,myAIC)
+nmcm<-arrange(nmcm,myAIC)
+
+mcm[1,1] #1 "mix-wei"
+nmcm[1,1] #6 "nmix-RP"
+
+###-----------------------------------------------------###
+###                   write results
+###-----------------------------------------------------###
+MODi<-26
+#lthaz
+cure_p<-cure_p1
+df1<-df_best_wei
+df_mod_1 <- left_join(df1, df_GP1, by = "Time") %>% mutate(Srv_mod = Srv_pop * cure_p + Srv_dis * (1 - cure_p),
+                                                           Pred = Haz_pop + ((1-cure_p)*Haz_dis * Srv_dis)/(cure_p+(1-cure_p)*Srv_dis))
+
+##  dfhazest1  ##
+df2 = tibble(Time = my_time2, Srv_dis = predict(best_wei, type = "survuncured", time = my_time2)[[1]]$Estimate,
+             Haz_dis = predict(best_RP2, type = "hazarduncured", time = my_time2)[[1]]$Estimate)
+df_mod_2 <- left_join(df2, df_GP2, by = "Time") %>% mutate(Srv_mod = Srv_pop * cure_p + Srv_dis * (1 - cure_p),
+                                                           Pred = Haz_pop + ((1-cure_p)*Haz_dis * Srv_dis)/(cure_p+(1-cure_p)*Srv_dis))
+
+##  dfhazest2  ##
+df3 = tibble(Time = my_time3, Srv_dis = predict(best_wei, type = "survuncured", time = my_time3)[[1]]$Estimate,
+             Haz_dis = predict(best_RP2, type = "hazarduncured", time = my_time3)[[1]]$Estimate)
+df_mod_3 <- left_join(df3, df_GP3, by = "Time") %>% mutate(Srv_mod = Srv_pop * cure_p + Srv_dis * (1 - cure_p),
+                                                           Pred = Haz_pop + ((1-cure_p)*Haz_dis * Srv_dis)/(cure_p+(1-cure_p)*Srv_dis))
+
+dfHazEst[MODi,]<-df_mod_2$Pred
+dfHazEst2[MODi,]<-df_mod_3$Pred
+ltHaz[md[MODi]] <- df_mod_1$Pred
+
+mixcure_surv_mod1<-df_mod_1$Srv_mod
+mixcure_surv_mod2<-df_mod_2$Srv_mod
+mixcure_surv_mod3<-df_mod_3$Srv_mod
+
+dfGOF[MODi,1] <- md[MODi]
+dfGOF[MODi,2] <- mcm$myLnL[1]
+dfGOF[MODi,3] <- mcm$myPram[1]
+dfGOF[MODi,5] <- paste(mcm$cm_name[1],mcm$myPS[1],sep = ":")
+
+MODi<-27
+cure_p<-cure_p_nmc
+df1<-df_RPncure
+## lthaz  ##
+## Add general population hazard and survival, derive overall model estimates.
+df_mod_1 <- left_join(df1, df_GP1, by = "Time") %>% mutate(Srv_mod = Srv_pop*cure_p^(1-Srv_dis),
+                                                           Pred = Haz_pop-log(cure_p)*Haz_dis*Srv_dis)
+                                                             
+##  dfhazest1  ##
+df2 = tibble(Time = my_time2, Srv_dis = predict(best_RP2, type = "survuncured", time = my_time2)[[1]]$Estimate,
+             Haz_dis = predict(best_RP2, type = "hazarduncured", time = my_time2)[[1]]$Estimate)
+df_mod_2 <- left_join(df2, df_GP2, by = "Time") %>% mutate(Srv_mod = Srv_pop*cure_p^(1-Srv_dis),
+                                                           Pred = Haz_pop-log(cure_p)*Haz_dis*Srv_dis)
+
+##  dfhazest2  ##
+df3 = tibble(Time = my_time3, Srv_dis = predict(best_RP2, type = "survuncured", time = my_time3)[[1]]$Estimate,
+             Haz_dis = predict(best_RP2, type = "hazarduncured", time = my_time3)[[1]]$Estimate)
+df_mod_3 <- left_join(df3, df_GP3, by = "Time") %>% mutate(Srv_mod = Srv_pop*cure_p^(1-Srv_dis),
+                                                           Pred = Haz_pop-log(cure_p)*Haz_dis*Srv_dis)
+
+
+dfHazEst[MODi,]<-df_mod_2$Pred
+dfHazEst2[MODi,]<-df_mod_3$Pred
+ltHaz[md[MODi]] <- df_mod_1$Pred
+
+nmixcure_surv_mod1<-df_mod_1$Srv_mod
+nmixcure_surv_mod2<-df_mod_2$Srv_mod
+nmixcure_surv_mod3<-df_mod_3$Srv_mod
+
+dfGOF[MODi,1] <- md[MODi]
+dfGOF[MODi,2] <- nmcm$myLnL[1]
+dfGOF[MODi,3] <- nmcm$myPram[1]
+dfGOF[MODi,5] <- paste(nmcm$cm_name[1],nmcm$myPS[1],sep = ":")
+
+```
+
+## #goodness-of-fit
+
+```{r goodness-of-fit, echo=TRUE}
+dfGOF$LnL<-as.numeric(dfGOF$LnL)
+dfGOF$Params<-as.numeric(dfGOF$Params)
+dfGOF$AIC <- -2*dfGOF$LnL + 2*dfGOF$Params
+for (MODi in 19:22) {
+  dfGOF[MODi,1] <- md[MODi]
+  dfGOF[MODi,2] <- NA
+  dfGOF[MODi,3] <- NA
+  dfGOF[MODi,4] <- NA
+  dfGOF[MODi,5] <- NA
+}
+
+```
+
+## #extrapolate for 6.5 years-surv data process
+
+```{r extrapolate for 6.5 years-surv data process, echo=TRUE}
+dfHaz <- t(na.omit(dfHazEst))
+colnames(dfHaz) <- c("exp","weibull","gamma","lnorm","gompertz","llogis","gengamma","FP1","FP2","RCS","RP-hazard","RP-odds","RP-normal","GAM","FP1-re","FP2-re","RCS-re","GAM-re","DSM-llld","DSM-glld","DSM-lllt","DSM-gllt","DSM-DGLM-LL","DSM-DGLM-LLLT","DSM-DGLM-LLGT","mix-cure","non-mix-cure")
+#,"mix-cure","non-mix-cure"
+dfHaz <- cbind(data.frame(Newtime$Time), dfHaz)
+#
+dfSurv<-as.data.frame(matrix(nrow = 78,ncol = 28))
+dfSurv[,1]<-dfHaz$Newtime.Time
+for ( i in 2:26 ) {
+  dftemp<-data.frame(dfHaz$Newtime.Time,dfHaz[[i]])
+  dftemp<-dftemp %>% 
+    dplyr::arrange(dftemp[[1]]) %>% 
+    dplyr::mutate(cumhaz = cumsum(dftemp[[2]])) %>% 
+    dplyr::mutate(survProp = exp(-1*cumhaz))
+  dfSurv[[i]]<-dftemp[[4]]
+}
+dfSurv$V27<-mixcure_surv_mod2
+dfSurv$V28<-nmixcure_surv_mod2
+
+prime1<-c(0,rep(1,27))
+dfSurv<-rbind(prime1,dfSurv)
+colnames(dfSurv) <-c("Time",md)
+
+dfFigSurv = dfSurv %>%
+  gather(key = "Model", value = "survProp", -Time) %>% mutate(Model = factor(Model))
+
+reference<-data.frame(Time=ltHaz_out$Time,Surv=ltHaz_out$surv)
+prime2<-c(0,1)
+reference<-rbind(prime2,reference)
+
+f_surv_mod2= ggplot() +
+  geom_line(data=dfFigSurv, aes(x=Time, y=survProp, group=Model, colour=Model), size=1) +
+  geom_line(data=reference, aes(x=Time, y=Surv,colour="KM"), size=1,colour="Black")+
+  scale_color_discrete(name="Model")+
+  expand_limits(y=c(0,1),x=c(0,6.5)) + 
+  facet_wrap(~Model,nrow=3)+
+  scale_x_continuous(breaks = c(seq(from=0, to=6.5,by = 1))) +
+  ylab("OS") +
+  xlab("Time(Years)") +
+  guides(color = guide_legend(ncol = 1))  +
+  theme(legend.position = "bottom") + 
+  theme_bw() 
+f_surv_mod2
+
+```
+
+## #within-sample-fit:3-years data process
+
+```{r within-sample-fit:3-years data process, echo=TRUE}
+dfHaz2<-ltHaz[,11:37]
+colnames(dfHaz2) <- c("exp","weibull","gamma","lnorm","gompertz","llogis","gengamma","FP1","FP2","RCS","RP-hazard","RP-odds","RP-normal","GAM","FP1-re","FP2-re","RCS-re","GAM-re","DSM-llld","DSM-glld","DSM-lllt","DSM-gllt","DSM-DGLM-LL","DSM-DGLM-LLLT","DSM-DGLM-LLGT","mix-cure","non-mix-cure")
+#,"mix-cure","non-mix-cure"
+dfHaz2 <- cbind(data.frame(ltHaz$Time), dfHaz2)
+dfSurv2<-as.data.frame(matrix(nrow = 36,ncol = 28))
+dfSurv2[,1]<-dfHaz2$ltHaz.Time
+for ( i in 2:26 ) {
+  dftemp<-data.frame(dfHaz2$ltHaz.Time,dfHaz2[[i]])
+  dftemp<-dftemp %>% 
+    dplyr::arrange(dftemp[[1]]) %>% 
+    dplyr::mutate(cumhaz = cumsum(dftemp[[2]])) %>% 
+    dplyr::mutate(survProp = exp(-1*cumhaz))
+  dfSurv2[[i]]<-dftemp[[4]]
+}
+dfSurv2$V27<-mixcure_surv_mod1
+dfSurv2$V28<-nmixcure_surv_mod1
+
+prime1<-c(0,rep(1,27))
+dfSurv2<-rbind(prime1,dfSurv2)
+colnames(dfSurv2) <-c("Time",md)
+
+dfFigSurv2 = dfSurv2 %>%
+  gather(key = "Model", value = "survProp", -Time) %>% mutate(Model = factor(Model))
+
+reference0<-data.frame(Time=ltHaz$Time,Surv=ltHaz$surv)
+prime2<-c(0,1)
+reference0<-rbind(prime2,reference0)
+
+f_surv_mod1= ggplot() +
+  geom_line(data=dfFigSurv2, aes(x=Time, y=survProp, group=Model, colour=Model), size=1) +
+  geom_line(data=reference0, aes(x=Time, y=Surv,colour="KM"), size=1,colour="Black")+
+  scale_color_discrete(name="Model")+
+  expand_limits(y=c(0,1),x=c(0,3)) + 
+  facet_wrap(~Model,nrow=3)+
+  scale_x_continuous(breaks = c(seq(from=0, to=3,by = 1))) +
+  ylab("OS") +
+  xlab("Time(Years)") +
+  guides(color = guide_legend(ncol = 1))  +
+  theme(legend.position = "bottom") + 
+  theme_bw() 
+f_surv_mod1
+
+```
+
+## #extrapolate for 40 years-surv data process
+
+```{r extrapolate for 40 years-surv data process, echo=TRUE}
+# dfHaz3 <- t(na.omit(dfHazEst2))
+dfHaz3 <-t(dfHazEst2)
+colnames(dfHaz3) <- c("exp","weibull","gamma","lnorm","gompertz","llogis","gengamma","FP1","FP2","RCS","RP-hazard","RP-odds","RP-normal","GAM","FP1-re","FP2-re","RCS-re","GAM-re","DSM-llld","DSM-glld","DSM-lllt","DSM-gllt","DSM-DGLM-LL","DSM-DGLM-LLLT","DSM-DGLM-LLGT","mix-cure","non-mix-cure")
+#,"mix-cure","non-mix-cure"
+dfHaz3 <- cbind(data.frame(Newtime2$Time), dfHaz3)
+#
+dfSurv3<-as.data.frame(matrix(nrow = 480,ncol = 28))
+dfSurv3[,1]<-dfHaz3$Newtime2.Time
+for ( i in 2:26 ) {
+  dftemp<-data.frame(dfHaz3$Newtime2.Time,dfHaz3[[i]])
+  dftemp<-dftemp %>% 
+    dplyr::arrange(dftemp[[1]]) %>% 
+    dplyr::mutate(cumhaz = cumsum(dftemp[[2]])) %>% 
+    dplyr::mutate(survProp = exp(-1*cumhaz))
+  dfSurv3[[i]]<-dftemp[[4]]
+}
+dfSurv3$V27<-mixcure_surv_mod3
+dfSurv3$V28<-nmixcure_surv_mod3
+
+prime1<-c(0,rep(1,27))
+dfSurv3<-rbind(prime1,dfSurv3)
+colnames(dfSurv3) <-c("Time",md)
+
+dfFigSurv3 = dfSurv3 %>%
+  gather(key = "Model", value = "survProp", -Time) %>% mutate(Model = factor(Model))
+
+reference<-data.frame(Time=ltHaz_out$Time,Surv=ltHaz_out$surv)
+prime2<-c(0,1)
+reference<-rbind(prime2,reference)
+
+f_surv_mod3= ggplot() +
+  geom_line(data=dfFigSurv3, aes(x=Time, y=survProp, group=Model, colour=Model), size=1) +
+  geom_line(data=reference, aes(x=Time, y=Surv,colour="KM"), size=1,colour="Black")+
+  scale_color_discrete(name="Model")+
+  expand_limits(y=c(0,1),x=c(0,40)) + 
+  facet_wrap(~Model,nrow=3)+
+  scale_x_continuous(breaks = c(seq(from=0, to=40,by = 5))) +
+  ylab("OS") +
+  xlab("Time(Years)") +
+  guides(color = guide_legend(ncol = 1))  +
+  theme(legend.position = "bottom") + 
+  theme_bw() 
+f_surv_mod3
+
+```
+
+## #calculate MSE
+
+```{r calculate MSE, echo=TRUE}
+# lthaz 3years data 
+MSE<-as.data.frame(matrix(nrow = 1,ncol = 27))
+colnames(MSE) <- md
+for (i in 1:27) {
+  MSE[i]<-mean((dfSurv2[,i+1]-reference0$Surv)^2)
+}
+MSE<-MSE*10000
+
+dfplotmse1<-data.frame(name=colnames(MSE),MSE=t(MSE[1,]))
+colnames(dfplotmse1)<-c("name","MSE")
+MSE_legend<-as.character(round(MSE[1,],digits=2)) 
+fig_mse_1<-ggplot(data=dfplotmse1,mapping=aes(x=name,y=MSE,fill=name,group=factor(1)))+
+  geom_bar(stat="identity",width=0.8)+
+  geom_text(aes(label = MSE_legend, vjust = -0.8, hjust = 0.5, color = name), show.legend = TRUE)
+fig_mse_1
+# dfhazest 6.5 years data 
+MSE2<-as.data.frame(matrix(nrow = 1,ncol = 27))
+colnames(MSE2) <- md
+for (i in 1:27) {
+  MSE2[i]<-mean((dfSurv[,i+1]-reference$Surv)^2)
+}
+MSE2<-MSE2*10000
+
+dfplotmse2<-data.frame(name=colnames(MSE2),MSE2=t(MSE2[1,]))
+colnames(dfplotmse2)<-c("name","MSE")
+MSE_legend2<-as.character(round(MSE2[1,],digits=2)) 
+fig_mse_2<-ggplot(data=dfplotmse2,mapping=aes(x=name,y=MSE,fill=name,group=factor(1)))+
+  geom_bar(stat="identity",width=0.8)+
+  geom_text(aes(label = MSE_legend2, vjust = -0.8, hjust = 0.5, color = name), show.legend = TRUE)
+fig_mse_2
+
+```
